@@ -1,0 +1,20 @@
+# Local audit documents and working drafts are not release material.
+/01-团队版改造新增内容清单.md
+/02-上传GitHub能否直接装载使用.md
+/03-证据索引.md
+/README-原核对说明.md
+/README-发布草稿.md
+
+# Includes complete source copies, logs, caches and temporary credentials.
+/verification-20260921/
+
+# Instance configuration and runtime data must remain local.
+.env
+.env.*
+!.env.example
+.credentials.yaml
+team-identity.json
+cordis.patch.yml
+/local/
+/runtime/
+/node_modules/
