@@ -84,11 +84,13 @@ export async function serveStatic(
   }
   let body: string | Buffer
   let type: string
+  let entryDocument = false
   try {
     if (target === distRoot || target === distIndex) {
       if (!authorizeIndex()) return
       body = await renderIndex()
       type = HTML_MIME
+      entryDocument = true
     } else {
       body = await readFile(target)
       type = MIME[extname(target)] ?? 'application/octet-stream'
@@ -101,7 +103,15 @@ export async function serveStatic(
     res.end()
     return
   }
-  res.writeHead(200, { 'content-type': type })
+  // The entry document is rendered per request from this process's current
+  // revisions of its client modules, and a superseded revision is refused rather
+  // than served. A browser that reuses a stored copy therefore asks for module
+  // URLs this process has never heard of, and the plugins they name fail to
+  // import. It is never reusable, so it says so instead of relying on a cache's
+  // default: assets beside it keep their own headers.
+  res.writeHead(200, entryDocument
+    ? { 'content-type': type, 'cache-control': 'no-store' }
+    : { 'content-type': type })
   res.end(body)
 }
 

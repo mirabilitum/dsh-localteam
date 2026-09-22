@@ -5,7 +5,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
-import type { ConnectionFetchHandler } from './rpc.ts'
+import type { ConnectionFetchHandler, ConnectionSubject } from './rpc.ts'
 
 /** Default carrier cap for all HTTP RPC bodies: sized for the default
  * aggregate image limit (200 MiB) after base64 expansion plus envelope
@@ -20,12 +20,14 @@ export const DEFAULT_MAX_REQUEST_BODY_BYTES = 300 * 1024 * 1024
  * @param res - node:http response the bridge writes and owns to completion.
  * @param apiHandler - fetch-shaped API carrier the request is dispatched to.
  * @param maxRequestBodyBytes - maximum bytes buffered for a buffered route.
+ * @param subject - identity the owning route already resolved from this request.
  */
 export async function bridge(
   req: IncomingMessage,
   res: ServerResponse,
   apiHandler: ConnectionFetchHandler,
   maxRequestBodyBytes = DEFAULT_MAX_REQUEST_BODY_BYTES,
+  subject?: ConnectionSubject,
 ): Promise<void> {
   const abort = new AbortController()
   // Client-disconnect detection MUST hang off the response, not the request:
@@ -80,7 +82,7 @@ export async function bridge(
       duplex: 'half',
     } as RequestInit & { duplex: 'half' })
   }
-  const response = await apiHandler.fetch(request)
+  const response = await apiHandler.fetch(request, subject)
   const requestUnread = bodyMode === 'streaming' && !req.readableEnded
   const responseHeaders = Object.fromEntries(response.headers.entries())
   res.writeHead(response.status, requestUnread ? { ...responseHeaders, connection: 'close' } : responseHeaders)

@@ -12,6 +12,12 @@ export interface TypertGatewayFaultDetails {
   readonly field?: string
 }
 
+/** Wire details a deployment access refusal carries. */
+export interface TypertGatewayRefusalDetails extends TypertGatewayFaultDetails {
+  /** The policy's own reason, so a caller can branch on why it was refused. */
+  readonly policyCode: string
+}
+
 declare module '@deepseek-ai/dsh-typert-protocol' {
   interface RemoteErrorDetailsMap {
     'gateway/ambiguous-endpoint': TypertGatewayFaultDetails
@@ -28,6 +34,7 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
     'gateway/lookup-unavailable': TypertGatewayFaultDetails
     'gateway/method-unavailable': TypertGatewayFaultDetails
     'gateway/provider-mismatch': TypertGatewayFaultDetails
+    'gateway/refused': TypertGatewayRefusalDetails
     'gateway/result-invalid': TypertGatewayFaultDetails
     'gateway/service-unavailable': TypertGatewayFaultDetails
     'gateway/signature-invalid': TypertGatewayFaultDetails

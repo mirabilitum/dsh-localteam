@@ -10,19 +10,23 @@ import {
 import { clientRequestSchema } from './rpc-schema.ts'
 import { bridge } from './http-bridge.ts'
 import { isTrustedApiRequest } from './api-request-trust.ts'
+import { CLIENT_INSTANCE_HEADER } from './identity.ts'
 import { API_PATH } from './api-path.ts'
 import type { BrowserAuth } from './browser-auth.ts'
 import type {
+  ConnectionAuthentication,
   ConnectionIndexRequest,
   ConnectionIndexResponse,
   ConnectionFetchRoute,
   ConnectionFetchHandler,
+  ConnectionIdentityResolver,
   HostConnectionFetch,
   ConnectionRpcEndpointMatcher,
   ConnectionRpcFailure,
   ConnectionRpcHandler,
   ConnectionRpcResult,
   ConnectionRequestRejection,
+  ConnectionSubject,
   ConnectionTrustRequest,
   HostConnectionHandle,
   HostConnectionRpc,
@@ -31,6 +35,11 @@ import type {
 const INVALID_REQUEST_RPC_ID = RpcId('invalid-request')
 const CHANNEL_PATTERN = /^\/[A-Za-z0-9._~-]+$/
 const ENDPOINT_SEGMENT_PATTERN = /^[A-Za-z0-9_$.-]+$/
+/**
+ * Longest accepted page instance id. It is opaque correlation the browser mints,
+ * so the bound only keeps a hostile header from becoming unbounded state.
+ */
+const MAX_CLIENT_INSTANCE_BYTES = 128
 
 interface ConnectionRpcInterceptor {
   readonly matches: ConnectionRpcEndpointMatcher
@@ -60,6 +69,8 @@ declare module '@deepseek-ai/cordis' {
 export class HostConnectionService extends Service implements HostConnectionHandle {
   private readonly interceptors = new Map<string, ConnectionRpcInterceptor>()
   private readonly fetchRoutes = new Map<string, RegisteredFetchRoute>()
+  private readonly requestSubjects = new WeakMap<object, ConnectionSubject>()
+  private identityResolver: ConnectionIdentityResolver | undefined
 
   /**
    * Provide the Host half over the active HTTP server.
@@ -95,8 +106,57 @@ export class HostConnectionService extends Service implements HostConnectionHand
 
   /** Apply the configured Host/Origin fence, then browser authentication. */
   requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection {
-    if (!isTrustedApiRequest(request, this.trustedHosts)) return 403
-    return this.browserAuth.isAuthenticated(request) ? undefined : 401
+    return this.authenticate(request).rejection
+  }
+
+  /**
+   * Apply the trust fence and resolve the caller identity in one pass.
+   *
+   * Admission is decided before identity is read, so a deployment resolver can
+   * never widen who reaches the transport; it only decides who an already
+   * admitted request belongs to.
+   */
+  authenticate(request: ConnectionTrustRequest): ConnectionAuthentication {
+    if (!isTrustedApiRequest(request, this.trustedHosts)) return { rejection: 403, subject: undefined }
+    if (!this.browserAuth.isAuthenticated(request)) return { rejection: 401, subject: undefined }
+    return { rejection: undefined, subject: this.subjectWithInstance(request) }
+  }
+
+  /**
+   * Resolve the caller and attach the page instance id the request declares.
+   *
+   * The member always comes from the resolver's own cookie read; the instance id
+   * is correlation the transport carries for control-lease checks, never a claim
+   * of identity. A request that omits or repeats the header still resolves its
+   * member, it simply cannot be told apart from another tab of that member.
+   */
+  private subjectWithInstance(request: ConnectionTrustRequest): ConnectionSubject | undefined {
+    const subject = this.identityResolver?.resolve(request.headers)
+    if (subject === undefined || subject.clientInstanceId !== undefined) return subject
+    const raw = request.headers instanceof Headers
+      ? request.headers.get(CLIENT_INSTANCE_HEADER)
+      : request.headers[CLIENT_INSTANCE_HEADER]
+    if (typeof raw !== 'string' || raw.length === 0 || raw.length > MAX_CLIENT_INSTANCE_BYTES) return subject
+    return { ...subject, clientInstanceId: raw }
+  }
+
+  /** Install the deployment's team-identity resolver for the calling fiber's lifetime. */
+  setIdentityResolver(resolver: ConnectionIdentityResolver): () => Promise<void> {
+    return this.ctx.effect(() => {
+      this.identityResolver = resolver
+      return () => {
+        if (this.identityResolver === resolver) this.identityResolver = undefined
+      }
+    }, 'client-connection: team identity resolver')
+  }
+
+  /**
+   * Read the subject resolved for one dispatched Fetch request.
+   * @param request - the exact request object handed to `createSharedFetchHandler().fetch`.
+   * @returns that request's subject, or undefined when it was not dispatched through this service.
+   */
+  subjectOf(request: Request): ConnectionSubject | undefined {
+    return this.requestSubjects.get(request)
   }
 
   /** Authenticate an index request through the process-token exchange or cookie. */
@@ -111,6 +171,12 @@ export class HostConnectionService extends Service implements HostConnectionHand
 
   /**
    * Compose one shared-channel Fetch handler from exact routes and its interceptor.
+   *
+   * The returned dispatcher applies no trust fence and no browser
+   * authentication: the owning Web route applies both before delegating here, as
+   * it always has. It does resolve the caller identity once per request when a
+   * deployment resolver is installed, so {@link ConnectionFetchHandler.subjectOf}
+   * can hand it to the route and endpoint owners below.
    * @param channel - shared channel mounted by Connection.
    * @returns Fetch handler that selects one owner or returns 404.
    */
@@ -122,7 +188,9 @@ export class HostConnectionService extends Service implements HostConnectionHand
         const route = this.fetchRoutes.get(url.pathname)
         return route?.methods.has(method) === true ? route.requestBody : 'buffered'
       },
-      fetch: (request) => {
+      subjectOf: request => this.requestSubjects.get(request),
+      fetch: (request, subject) => {
+        this.recordSubjectFor(request, subject)
         const pathname = new URL(request.url).pathname
         const route = this.fetchRoutes.get(pathname)
         if (route?.methods.has(request.method) === true) return route.fetch(request)
@@ -134,6 +202,31 @@ export class HostConnectionService extends Service implements HostConnectionHand
         return interceptor.fetchHandler.fetch(request)
       },
     }
+  }
+
+  /**
+   * Record the caller identity for one request that is already below the trust fence.
+   *
+   * The `/api` Web route authenticates first and then delegates here, so the
+   * subject usually arrives resolved. A route reached without that step still
+   * resolves from the request's own headers, so identity never depends on which
+   * entry performed the fencing.
+   * @param request - request object handed to the shared dispatcher.
+   * @param resolved - identity the caller already resolved, when it did.
+   * @returns the recorded subject, or undefined when the deployment has none.
+   */
+  private recordSubjectFor(
+    request: Request,
+    resolved?: ConnectionSubject,
+  ): ConnectionSubject | undefined {
+    const existing = resolved ?? this.requestSubjects.get(request)
+    if (existing !== undefined) {
+      this.requestSubjects.set(request, existing)
+      return existing
+    }
+    const subject = this.identityResolver?.resolve(request.headers)
+    if (subject !== undefined) this.requestSubjects.set(request, subject)
+    return subject
   }
 
   private registerFetchRoute(
@@ -161,7 +254,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
     handler: ConnectionRpcHandler,
   ): () => Promise<void> {
     assertChannel(channel)
-    const fetchHandler = rpcFetchHandler(channel, handler)
+    const fetchHandler = rpcFetchHandler(channel, handler, request => this.subjectOf(request))
     const route: WebRoute = {
       kind: 'prefix',
       path: channel,
@@ -192,7 +285,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
     }
     const interceptor: ConnectionRpcInterceptor = {
       matches,
-      fetchHandler: rpcFetchHandler(channel, handler),
+      fetchHandler: rpcFetchHandler(channel, handler, request => this.subjectOf(request)),
     }
     return owner.effect(() => {
       if (this.interceptors.has(channel)) {
@@ -209,9 +302,11 @@ export class HostConnectionService extends Service implements HostConnectionHand
 function rpcFetchHandler(
   channel: string,
   handler: ConnectionRpcHandler,
+  subjectOf: (request: Request) => ConnectionSubject | undefined,
 ): ConnectionFetchHandler {
   return {
     requestBodyMode: () => 'buffered',
+    subjectOf,
     async fetch(request: Request): Promise<Response> {
       const endpoint = endpointFromPath(channel, new URL(request.url).pathname)
       if (request.method !== 'POST' || endpoint === undefined) {
@@ -244,7 +339,7 @@ function rpcFetchHandler(
       }
 
       try {
-        const result = await handler(endpoint, message.payload, request.signal)
+        const result = await handler(endpoint, message.payload, request.signal, subjectOf(request))
         return fullResponse(message.rpcId, result)
       } catch (error) {
         return new Response(`handler failure: ${String(error)}`, { status: 500 })

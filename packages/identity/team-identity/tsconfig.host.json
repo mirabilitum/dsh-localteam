@@ -1,0 +1,59 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib/types",
+    "tsBuildInfoFile": "lib/tsconfig.host.tsbuildinfo"
+  },
+  "files": [
+    "src/call-policy.ts",
+    "src/cookie.ts",
+    "src/http-route.ts",
+    "src/index.ts",
+    "src/paths.ts",
+    "src/project-layout.ts",
+    "src/provenance.ts",
+    "src/registry.ts",
+    "src/service.ts",
+    "src/session-control.ts",
+    "src/session-temp.ts",
+    "src/sign-in-page.ts",
+    "src/workspace-root.ts",
+    "src/zip.ts"
+  ],
+  "references": [
+    {
+      "path": "../../../vendor/cordis"
+    },
+    {
+      "path": "../../../vendor/schemastery"
+    },
+    {
+      "path": "../../../vendor/timer"
+    },
+    {
+      "path": "../../api/gateway/tsconfig.host.json"
+    },
+    {
+      "path": "../../client/connection/tsconfig.host.json"
+    },
+    {
+      "path": "../../core/session"
+    },
+    {
+      "path": "../../core/tools"
+    },
+    {
+      "path": "../../host/directory-picker-browse"
+    },
+    {
+      "path": "../../shell/shell-env"
+    },
+    {
+      "path": "../../host/webserver"
+    },
+    {
+      "path": "../../util/home-paths"
+    }
+  ]
+}

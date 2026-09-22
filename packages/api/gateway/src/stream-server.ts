@@ -3,6 +3,7 @@
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import WebSocket, { WebSocketServer, type RawData } from 'ws'
+import type { ConnectionSubject } from '@deepseek-ai/dsh-client-connection'
 import {
   parseRemoteStreamClientMessage,
   type RemoteStreamFailure,
@@ -14,6 +15,7 @@ export type RemoteStreamOpener = (
   endpoint: string,
   payload: unknown,
   signal: AbortSignal,
+  subject: ConnectionSubject | undefined,
 ) => Promise<AsyncIterable<unknown>>
 
 /** Convert an invocation or carrier failure to a stable wire value. */
@@ -26,6 +28,14 @@ export class RemoteStreamMuxServer {
   private readonly server = new WebSocketServer({ noServer: true })
   private readonly connections = new Set<Promise<void>>()
   private readonly missedHeartbeats = new WeakMap<WebSocket, number>()
+  /**
+   * Identity captured at upgrade time, one entry per physical socket.
+   *
+   * Every logical stream inherited from this socket carries it, and it is what
+   * makes revocation actionable: a connection with no recorded subject could
+   * only be closed by ending the whole acceptor.
+   */
+  private readonly subjects = new WeakMap<WebSocket, ConnectionSubject>()
   private heartbeatTimer: NodeJS.Timeout | undefined
 
   /**
@@ -44,17 +54,42 @@ export class RemoteStreamMuxServer {
    * @param req - authenticated HTTP upgrade request.
    * @param socket - carrier socket transferred to the WebSocket server.
    * @param head - bytes already read after the HTTP upgrade headers.
+   * @param subject - identity resolved at upgrade time, saved for every logical stream.
    */
-  handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+  handleUpgrade(
+    req: IncomingMessage,
+    socket: Duplex,
+    head: Buffer,
+    subject?: ConnectionSubject,
+  ): void {
     this.server.handleUpgrade(req, socket, head, (websocket) => {
+      if (subject !== undefined) this.subjects.set(websocket, subject)
       this.missedHeartbeats.set(websocket, 0)
       websocket.on('pong', () => { this.missedHeartbeats.set(websocket, 0) })
       this.startHeartbeat()
-      const connection = new RemoteStreamMuxConnection(websocket, this.open, this.failure)
+      const connection = new RemoteStreamMuxConnection(websocket, this.open, this.failure, subject)
       const done = connection.run()
       this.connections.add(done)
       void done.then(() => { this.connections.delete(done) })
     })
+  }
+
+  /**
+   * Terminate every socket whose recorded identity belongs to one user.
+   *
+   * Revocation must reach established connections: a stream that was accepted
+   * before the account was disabled would otherwise keep serving it.
+   * @param userId - team user whose connections must end.
+   * @returns how many sockets were terminated.
+   */
+  closeSubject(userId: string): number {
+    let closed = 0
+    for (const socket of this.server.clients) {
+      if (this.subjects.get(socket)?.userId !== userId) continue
+      socket.close(1008, 'identity revoked')
+      closed += 1
+    }
+    return closed
   }
 
   /** Terminate all sockets and wait until every iterator has returned. */
@@ -107,6 +142,7 @@ class RemoteStreamMuxConnection {
     private readonly socket: WebSocket,
     private readonly open: RemoteStreamOpener,
     private readonly failure: RemoteStreamFailureMapper,
+    private readonly subject: ConnectionSubject | undefined,
   ) {}
 
   async run(): Promise<void> {
@@ -159,7 +195,7 @@ class RemoteStreamMuxConnection {
     active: ActiveStream,
   ): Promise<void> {
     try {
-      const source = await this.open(endpoint, payload, active.abort.signal)
+      const source = await this.open(endpoint, payload, active.abort.signal, this.subject)
       for await (const value of source) {
         await this.send({ type: 'item', streamId, value })
       }

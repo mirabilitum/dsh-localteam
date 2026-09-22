@@ -13,9 +13,12 @@ import { HostConnectionService } from './rpc-host.ts'
 import { ConnectionRecoveryConfigSchema, resolveConnectionConfig, type ConnectionRecoveryConfig } from './recovery-config.ts'
 
 export type {
+  ConnectionActorType,
+  ConnectionAuthentication,
   ConnectionFetchMethod,
   ConnectionFetchHandler,
   ConnectionFetchRoute,
+  ConnectionIdentityResolver,
   ConnectionIndexRequest,
   ConnectionIndexResponse,
   ConnectionRpcEndpointMatcher,
@@ -24,6 +27,7 @@ export type {
   ConnectionRequestRejection,
   ConnectionRpcResult,
   ConnectionRequestBodyMode,
+  ConnectionSubject,
   ConnectionTrustRequest,
   ClientRequest,
   HostConnectionHandle,
@@ -126,13 +130,15 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
       kind: 'prefix',
       path: API_PATH,
       handler: async (req, res) => {
-        const rejection = connection.requestRejection(req)
-        if (rejection !== undefined) {
-          res.writeHead(rejection)
-          res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
+        // One pass resolves both the fence status and the caller identity, so
+        // every route below receives the subject the fence already admitted.
+        const authentication = connection.authenticate(req)
+        if (authentication.rejection !== undefined) {
+          res.writeHead(authentication.rejection)
+          res.end(authentication.rejection === 401 ? 'unauthorized' : 'forbidden')
           return
         }
-        await bridge(req, res, fetchHandler, maxRequestBodyBytes)
+        await bridge(req, res, fetchHandler, maxRequestBodyBytes, authentication.subject)
       },
     }
     webCtx.effect(() => webCtx.webServer.register(route), 'client-connection: /api route')

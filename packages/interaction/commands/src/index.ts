@@ -4,6 +4,7 @@
  */
 
 import { Context } from '@deepseek-ai/cordis'
+import { remoteCaller } from '@deepseek-ai/dsh-api-gateway'
 import { randomUUID } from '@deepseek-ai/dsh-util-crypto'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { AttachmentError, admitEncodedImages } from '@deepseek-ai/dsh-attachment'
@@ -370,11 +371,17 @@ export class CommandRuntime extends TypertRemoteService {
     if (command === undefined) return undefined
     if (signal.aborted) throw abortError(signal)
     const commandId = this.mintCommandId()
+    // Who issued this line, when the deployment can say. The member is the
+    // transport's answer, read from the invocation this method is running inside
+    // — a browser never supplies it, and a deployment without identity records no
+    // author rather than inventing one. `/permission` is a command, so this is
+    // what makes a policy change attributable afterwards.
+    const teamUserId = remoteCaller()?.userId
     this.appendLifecycle(agent.session, 'command/run', {
       commandId,
       name: parsed.name,
       ...command.definition.recordInput === false ? {} : { args: parsed.rawInput },
-      source: { kind: 'user' },
+      source: { kind: 'user', ...(teamUserId === undefined ? {} : { teamUserId }) },
     })
     const settle = (result: CommandResult): CommandExecution => {
       this.appendLifecycle(agent.session, 'command/done', {

@@ -1,5 +1,6 @@
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
+import { runWithRemoteCaller } from '@deepseek-ai/dsh-api-gateway'
 import { createInboxStub } from '@deepseek-ai/dsh-agent-loop-testkit'
 import type { Agent, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import AttachmentStore, { AttachmentId } from '@deepseek-ai/dsh-attachment'
@@ -339,6 +340,24 @@ describe('Session file uploads', () => {
     agent.inbox.append('next-turn', followup.mock.calls[0]?.[0] as UserMessage)
     await expect(controller.prompt(request)).resolves.toEqual({ accepted: true })
     expect(followup).toHaveBeenCalledOnce()
+  })
+
+  it('records the member the transport resolved, and nobody when it could not', async () => {
+    // The transcript has to be able to answer who sent a message. The author is
+    // the transport's answer, read from the invocation — never a payload field.
+    const attributed = await uploadHarness()
+    await runWithRemoteCaller(
+      { userId: 'u-alice', tokenId: 't-1', actorType: 'user' },
+      () => attributed.controller.prompt(promptRequest([{ type: 'text', text: 'from alice' }])),
+    )
+    const sent = attributed.followup.mock.calls[0]?.[0] as UserMessage
+    expect(sent.source).toMatchObject({ kind: 'user', teamUserId: 'u-alice' })
+
+    // An unauthenticated deployment records no author rather than guessing one.
+    const anonymous = await uploadHarness()
+    await anonymous.controller.prompt(promptRequest([{ type: 'text', text: 'from nobody' }]))
+    const unattributed = anonymous.followup.mock.calls[0]?.[0] as UserMessage
+    expect(unattributed.source).not.toHaveProperty('teamUserId')
   })
 
   it('deduplicates a retried rpcId already present in the durable log', async () => {

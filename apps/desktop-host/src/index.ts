@@ -208,6 +208,7 @@ function assetHandler(ctx: Context, runtimeDir: string): ConnectionFetchHandler 
   }
   return {
     requestBodyMode: () => 'buffered',
+    subjectOf: () => undefined,
     async fetch(request): Promise<Response> {
       if (request.method !== 'GET' && request.method !== 'HEAD') return new Response(null, { status: 405 })
       const url = new URL(request.url)
@@ -237,6 +238,7 @@ function assetHandler(ctx: Context, runtimeDir: string): ConnectionFetchHandler 
 function remoteStreamHandler(ctx: Context): ConnectionFetchHandler {
   return {
     requestBodyMode: () => 'buffered',
+    subjectOf: () => undefined,
     async fetch(request): Promise<Response> {
       if (request.method !== 'POST') return new Response(null, { status: 405 })
       const gateway = ctx.get('typertGateway')

@@ -127,7 +127,12 @@ export function resolveLanTrust(bindHost: string, extra: readonly string[]): Web
     ? Object.values(networkInterfaces()).flat()
       .filter((iface): iface is NonNullable<typeof iface> => iface !== undefined && iface.family === 'IPv4' && !iface.internal)
       .map(iface => iface.address)
-    : []
+    // One named interface is the same situation as all interfaces, scoped: the
+    // operator said which address to serve, so that address is what this
+    // deployment is reached by and belongs in the fence without being repeated.
+    : bindHost === LOOPBACK_HOST || bindHost === ''
+      ? []
+      : [bindHost]
   return { lanAddresses, trustedHosts: [...lanAddresses, ...extra] }
 }
 

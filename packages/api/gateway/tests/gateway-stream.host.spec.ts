@@ -620,6 +620,154 @@ describe('Typert Remote streams', () => {
     await unregister()
   })
 
+  it('refuses an answer the deployment says no longer belongs to the caller', async () => {
+    const { ctx } = await setup(true)
+    ctx.connection.setIdentityResolver({
+      resolve: (headers) => {
+        const raw = headers instanceof Headers ? headers.get('x-test-subject') : headers['x-test-subject']
+        if (typeof raw !== 'string') return undefined
+        const [userId, tokenId] = raw.split(':') as [string, string]
+        return { userId, tokenId, actorType: 'user' }
+      },
+    })
+    const source = new RemoteEventSourceProbe()
+    const unregister = ctx.typertGateway.registerRemoteEvents(source.source, REMOTE_HOST)
+    const agent = ctx.extend()
+
+    // A deployment that decides who may answer, and refuses this member.
+    let allowed = false
+    ctx.typertGateway.setEventAnswerPolicy({ accepts: () => allowed })
+
+    // An unidentifiable connection must not be handed an owned request: being
+    // nameless cannot be a way past the owner filter.
+    ctx.typertGateway.setEventOwnerResolver({ ownerOf: () => ({ userId: 'u-alice', tokenId: 't-alice', actorType: 'user' }) })
+    const anonymous = await openEventClient(ctx, 'events-anonymous')
+    const alice = await openEventClient(ctx, 'events-answer-alice', { userId: 'u-alice', tokenId: 't-alice' })
+    const pending = pendingInvocation(agent)
+    source.push(pending.dispatch)
+    await vi.waitFor(() => { expect(deliveredInvocation(alice)).toBeDefined() })
+    expect(deliveredInvocation(anonymous)).toBeUndefined()
+
+    // Holding the delivery is not permission to settle it: the deployment's rule
+    // is asked on the same terms that routed the request.
+    const refusedResponse = await fetch(`${alice.origin}/api/$events/result`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: alice.cookie },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: 'answer-refused',
+        method: '$events/result',
+        payload: {
+          args: {
+            clientId: alice.clientId,
+            eventId: (deliveredInvocation(alice) as RemoteEventInvocationFrame).eventId,
+            outcome: { kind: 'result', value: 'answered by the wrong caller' },
+          },
+        },
+      }),
+    })
+    const refused = await refusedResponse.json() as {
+      readonly result?: { readonly ok?: boolean; readonly error?: { readonly code?: string } }
+    }
+    expect(refused.result?.ok).toBe(false)
+    expect(refused.result?.error?.code).toBe('gateway/refused')
+    // Still waiting, because the answer never settled anything.
+    expect(pending.resolve).not.toHaveBeenCalled()
+
+    // Once the deployment admits this caller the same request settles normally.
+    allowed = true
+    await sendEventResult(alice, deliveredInvocation(alice) as RemoteEventInvocationFrame, { kind: 'result', value: 'ok' })
+    expect(pending.resolve).toHaveBeenCalledTimes(1)
+
+    const abandoned = expect(pending.outcome).resolves.toMatchObject({ kind: 'result' })
+    anonymous.socket.close()
+    alice.socket.close()
+    await unregister()
+    await abandoned
+  })
+
+  it('moves an outstanding interaction request to the conversation new controller', async () => {
+    const { ctx } = await setup(true)
+    // Stand in for a deployment that resolves callers from the upgrade request.
+    ctx.connection.setIdentityResolver({
+      resolve: (headers) => {
+        const raw = headers instanceof Headers ? headers.get('x-test-subject') : headers['x-test-subject']
+        if (typeof raw !== 'string') return undefined
+        const [userId, tokenId] = raw.split(':') as [string, string]
+        return { userId, tokenId, actorType: 'user' }
+      },
+    })
+    const source = new RemoteEventSourceProbe()
+    const unregister = ctx.typertGateway.registerRemoteEvents(source.source, REMOTE_HOST)
+    const agent = ctx.extend()
+    const alice = await openEventClient(ctx, 'events-alice', { userId: 'u-alice', tokenId: 't-alice' })
+    const bob = await openEventClient(ctx, 'events-bob', { userId: 'u-bob', tokenId: 't-bob' })
+
+    // The conversation belongs to Alice while the request is outstanding.
+    ctx.typertGateway.setEventOwnerResolver({ ownerOf: () => ({ userId: 'u-alice', tokenId: 't-alice', actorType: 'user' }) })
+    const pending = pendingInvocation(agent)
+    source.push(pending.dispatch)
+    await vi.waitFor(() => { expect(deliveredInvocation(alice)).toBeDefined() })
+    // A viewer who is not the owner never receives an interaction request.
+    expect(deliveredInvocation(bob)).toBeUndefined()
+
+    // Control moves to Bob: the request must leave Alice and reach him.
+    ctx.typertGateway.setEventOwnerResolver({ ownerOf: () => ({ userId: 'u-bob', tokenId: 't-bob', actorType: 'user' }) })
+    expect(ctx.typertGateway.reDeliverRemoteEvents('agent-1')).toBe(1)
+
+    await vi.waitFor(() => { expect(deliveredInvocation(bob)).toBeDefined() })
+    const moved = deliveredInvocation(bob) as RemoteEventInvocationFrame
+    // Alice is told to stop waiting, so her late answer cannot settle it. The
+    // frame is queued before it is written, so wait for it to arrive.
+    const cancellations = (): readonly unknown[] => alice.frames
+      .filter(frame => frame.type === 'item' && frame.streamId === alice.streamId)
+      .map(frame => frame.value)
+      .filter(value => typeof value === 'object' && value !== null
+        && Reflect.get(value, 'type') === 'cancel')
+      .map(value => Reflect.get(value as object, 'eventId'))
+    await vi.waitFor(() => { expect(cancellations()).toContain(moved.eventId) })
+
+    // Removing the source rejects whatever it was still waiting on, so observe
+    // that outcome: an unobserved rejection here is reported by the runner as an
+    // unhandled one, which fails the run with no failing test.
+    const abandoned = expect(pending.outcome).rejects.toThrow('forwarded Remote event source was removed')
+    alice.socket.close()
+    bob.socket.close()
+    await unregister()
+    await abandoned
+  })
+
+  it('withdraws an interaction request from its holders when nobody owns the Agent', async () => {
+    const { ctx } = await setup(true)
+    const source = new RemoteEventSourceProbe()
+    const unregister = ctx.typertGateway.registerRemoteEvents(source.source, REMOTE_HOST)
+    const agent = ctx.extend()
+    const client = await openEventClient(ctx, 'events-unowned')
+    const pending = pendingInvocation(agent)
+    source.push(pending.dispatch)
+    await vi.waitFor(() => { expect(deliveredInvocation(client)).toBeDefined() })
+    const delivered = deliveredInvocation(client) as RemoteEventInvocationFrame
+
+    // Cancelling into nowhere would strand the Agent forever, so an unowned
+    // request stays pending — but it must leave its holder. A holder who kept it
+    // would still be offered a prompt whose answer can settle the request, which
+    // is exactly what "the controller is gone" is not allowed to mean.
+    expect(ctx.typertGateway.reDeliverRemoteEvents('agent-1')).toBe(1)
+    await vi.waitFor(() => {
+      const cancellations = client.frames
+        .filter(frame => frame.type === 'item' && frame.streamId === client.streamId)
+        .map(frame => frame.value)
+        .filter(value => typeof value === 'object' && value !== null && Reflect.get(value, 'type') === 'cancel')
+        .map(value => Reflect.get(value as object, 'eventId'))
+      expect(cancellations).toContain(delivered.eventId)
+    })
+
+    const abandoned = expect(pending.outcome).rejects.toThrow('forwarded Remote event source was removed')
+    client.socket.close()
+    await unregister()
+    await abandoned
+  })
+
   it('fans one scoped waterfall out and accepts the first Client result', async () => {
     const { ctx } = await setup(true)
     const source = new RemoteEventSourceProbe()
@@ -996,11 +1144,20 @@ interface RemoteEventTestClient {
   readonly cookie: string
 }
 
-async function openEventClient(ctx: Context, streamId: string): Promise<RemoteEventTestClient> {
+async function openEventClient(
+  ctx: Context,
+  streamId: string,
+  subject?: { readonly userId: string; readonly tokenId: string },
+): Promise<RemoteEventTestClient> {
   const origin = `http://127.0.0.1:${String(ctx.webServer.port)}`
   const cookie = browserCookie(ctx)
   const socket = new WebSocket(`${origin.replace('http:', 'ws:')}/api/remote.mux`, {
-    headers: { cookie },
+    headers: {
+      cookie,
+      // The transport resolves a caller identity from the upgrade request when a
+      // deployment resolver is installed.
+      ...subject === undefined ? {} : { 'x-test-subject': `${subject.userId}:${subject.tokenId}` },
+    },
   })
   await once(socket, 'open')
   const frames: Record<string, unknown>[] = []

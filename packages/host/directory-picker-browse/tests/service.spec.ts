@@ -1,6 +1,6 @@
 /** Behavior of the browse backend over a real temporary directory tree. */
 
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -227,5 +227,108 @@ describe('BrowseDirectoryPicker', () => {
     // Missing parent is a real failure, not a level to invent.
     const missingParent = await capability.createDirectory(join(root, 'no-such-dir'), 'child').catch((error: unknown) => error)
     expect((missingParent as DirectoryPickerError).code).toBe('directory-create-failed')
+  })
+})
+
+/**
+ * A deployment that serves browsers it does not control confines the whole
+ * interaction, so a remote visitor cannot make any directory on the host their
+ * session workspace. The fence must hold for the listing, for creation, and
+ * across a symlink that points out of it.
+ */
+describe('a confined root', () => {
+  let gate: string
+  let outside: string
+  let confined: DirectoryPickerBrowseCapability
+  let confinedDispose: () => Promise<void>
+
+  beforeAll(async () => {
+    // Canonical, because the fence compares real paths and a listing reports the
+    // canonical form: a temp directory whose spelling differs from its real path
+    // (Windows short names, case) would otherwise fail these assertions for a
+    // reason that has nothing to do with the confinement.
+    gate = await realpath(await mkdtemp(join(tmpdir(), 'dsh-browse-gate-')))
+    outside = await realpath(await mkdtemp(join(tmpdir(), 'dsh-browse-outside-')))
+    await mkdir(join(gate, 'projects'))
+    await mkdir(join(outside, 'elsewhere'))
+    try {
+      await symlink(outside, join(gate, 'escape'), 'junction')
+    } catch {
+      // Windows denies unprivileged symlinks in some configurations; the
+      // escape row then simply never appears in the listing.
+    }
+    const ctx = new Context()
+    const fiber = ctx.plugin(BrowseDirectoryPicker, { root: gate })
+    await fiber.await()
+    const picked = ctx.get('directoryPicker')!.capability()
+    if (picked.kind !== 'browse') throw new Error('browse backend must advertise the browse capability')
+    confined = picked
+    confinedDispose = () => fiber.dispose()
+  })
+
+  afterAll(async () => {
+    await confinedDispose()
+    await rm(gate, { recursive: true, force: true })
+    await rm(outside, { recursive: true, force: true })
+  })
+
+  it('opens on the root and reports it as home, so no affordance points outside', async () => {
+    const listing = await confined.list()
+    expect(listing.path).toBe(gate)
+    expect(listing.home).toBe(gate)
+    // The breadcrumb starts at the fence rather than at the filesystem root.
+    expect(listing.crumbs.map(crumb => crumb.path)).toEqual([gate])
+  })
+
+  it('lists inside the root and refuses every path above or beside it', async () => {
+    const inside = await confined.list(join(gate, 'projects'))
+    expect(inside.entries).toEqual([])
+    expect(inside.crumbs.map(crumb => crumb.path)).toEqual([gate, join(gate, 'projects')])
+
+    for (const target of [outside, join(outside, 'elsewhere'), homedir(), join(gate, '..')]) {
+      const failure = await confined.list(target).catch((error: unknown) => error)
+      expect(failure).toBeInstanceOf(DirectoryPickerError)
+      expect((failure as DirectoryPickerError).code).toBe('directory-unreadable')
+      expect((failure as DirectoryPickerError).message).toContain('outside the configured root')
+    }
+  })
+
+  it('creates inside the root and refuses a parent outside it', async () => {
+    const created = await confined.createDirectory(join(gate, 'projects'), 'alpha')
+    expect(created).toBe(join(gate, 'projects', 'alpha'))
+
+    const failure = await confined.createDirectory(outside, 'child').catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(DirectoryPickerError)
+    expect((failure as DirectoryPickerError).code).toBe('directory-create-failed')
+    expect((failure as DirectoryPickerError).message).toContain('outside the configured root')
+  })
+
+  it('refuses a symlink inside the root that resolves outside it', async () => {
+    // A purely textual check would accept this entry and hand over the target.
+    const escape = join(gate, 'escape')
+    const failure = await confined.list(escape).catch((error: unknown) => error)
+    if (failure === undefined) return
+    if (!(failure instanceof DirectoryPickerError)) {
+      // The platform refused to create the link at all: nothing to confine.
+      return
+    }
+    expect(failure.code).toBe('directory-unreadable')
+    expect(failure.message).toContain('outside the configured root')
+  })
+
+  it('refuses an unusable configured root instead of silently listing the filesystem', async () => {
+    const ctx = new Context()
+    const fiber = ctx.plugin(BrowseDirectoryPicker, { root: join(gate, 'no-such-root') })
+    await fiber.await()
+    try {
+      const picked = ctx.get('directoryPicker')!.capability()
+      if (picked.kind !== 'browse') throw new Error('browse backend must advertise the browse capability')
+      const failure = await picked.list().catch((error: unknown) => error)
+      expect(failure).toBeInstanceOf(DirectoryPickerError)
+      expect((failure as DirectoryPickerError).code).toBe('directory-unreadable')
+      expect((failure as DirectoryPickerError).message).toContain('cannot be resolved')
+    } finally {
+      await fiber.dispose()
+    }
   })
 })

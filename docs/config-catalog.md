@@ -197,7 +197,7 @@ export interface Config {
 }
 ```
 
-Source: [`packages/api/gateway/src/index.ts:119`](../packages/api/gateway/src/index.ts)
+Source: [`packages/api/gateway/src/index.ts:142`](../packages/api/gateway/src/index.ts)
 
 <a id="deepseek-aidsh-api-session-controller"></a>
 
@@ -422,7 +422,7 @@ export interface ConnectionRecoveryConfig {
 }
 ```
 
-Source: [`packages/client/connection/src/index.ts:72`](../packages/client/connection/src/index.ts)
+Source: [`packages/client/connection/src/index.ts:76`](../packages/client/connection/src/index.ts)
 
 <a id="deepseek-aidsh-client-hmr"></a>
 
@@ -981,12 +981,21 @@ Source: [`packages/hooks/hooks-codex/src/index.ts:43`](../packages/hooks/hooks-c
 ```ts config-catalog
 /** Validated plugin configuration. */
 export interface Config {
-  /** Complete-result bound of one listing level; see {@link BrowseDirectoryPicker.Config}. */
-  maxEntries: number
+  /** Complete-result bound of one listing level; see {@link BrowseDirectoryPicker.Config}. @default DEFAULT_MAX_ENTRIES */
+  maxEntries?: number | null
+  /**
+   * Directory the whole interaction is confined to.
+   *
+   * Omitted means the backend keeps the seam's whole-filesystem scope, which is
+   * right for a loopback-only host whose chooser serves the person at the
+   * console. A deployment that serves browsers it does not control sets this so
+   * a remote visitor cannot make any directory on the host their workspace.
+   */
+  root?: string | null
 }
 ```
 
-Source: [`packages/host/directory-picker-browse/src/index.ts:181`](../packages/host/directory-picker-browse/src/index.ts)
+Source: [`packages/host/directory-picker-browse/src/index.ts:222`](../packages/host/directory-picker-browse/src/index.ts)
 
 <a id="deepseek-aidsh-host-frontend-static"></a>
 
@@ -1042,8 +1051,16 @@ Source: [`packages/host/open-in-app/src/index.ts:50`](../packages/host/open-in-a
 ```ts config-catalog
 /** Web server listen and response-compression config. */
 export interface Config {
-  /** Listen host; the two supported values are loopback and all-interfaces. */
-  host: '127.0.0.1' | '0.0.0.0'
+  /**
+   * Listen host: loopback, all-interfaces, or one specific interface address.
+   *
+   * A literal interface address is how a deployment serves one network without
+   * exposing every interface it happens to have, so it is a supported value
+   * rather than a config error. The composing application decides which of these
+   * it is willing to accept; binding is attempted as given and an unroutable
+   * value fails loudly at listen time.
+   */
+  host: string
   /** Listen port; zero requests an OS-assigned port. */
   port: number
   /** Response compression for socket-backed HTTP requests. @default 'none' */
@@ -2759,6 +2776,104 @@ export interface Config {
 ```
 
 Source: [`packages/core/system-prompt/src/index.ts:248`](../packages/core/system-prompt/src/index.ts)
+
+<a id="deepseek-aidsh-team-identity"></a>
+
+## `@deepseek-ai/dsh-team-identity`
+
+Requires: `connection`
+
+```ts config-catalog
+/** Team identity configuration. */
+export interface Config {
+  /** Members admitted to this deployment. An empty list admits nobody. */
+  readonly members?: TeamMemberConfig[] | null
+  /** Lifetime of one issued token in days. @default 30 */
+  readonly tokenTtlDays?: number | null
+  /** Maximum live tokens kept before the oldest expire. @default 200 */
+  readonly tokenLimit?: number | null
+  /** Harness home holding the registry; defaults to the resolved `$DSH_HOME`. */
+  readonly homePath?: string | null
+  /**
+   * How long a conversation's holder may be idle before another member may take
+   * it over, in minutes.
+   *
+   * Deliberately **not** an expiry: nothing moves control on its own. A member
+   * away for longer than this is displaced only when somebody decides to take
+   * the conversation, which is what makes the change visible rather than silent.
+   * @default 15
+   */
+  readonly takeoverIdleMinutes?: number | null
+  /**
+   * Whether two conversations may write one project directory at the same time.
+   *
+   * Off by default: a deployment whose Sessions all share one directory would be
+   * serialized as one project, which is almost certainly not what it meant. Turn
+   * it on together with the project layout — a shared `input\`/`build\`/`work\`
+   * per project and a private `temp\` per Session — where the only remaining
+   * collision is two conversations writing the same deliverable.
+   * @default false
+   */
+  readonly serializeProjectWrites?: boolean | null
+  /**
+   * Directory a Session's workspace must be created under.
+   *
+   * Omitted leaves workspace choice to the caller, which is right for a
+   * loopback-only deployment serving the person at the console. A deployment that
+   * serves browsers it does not control sets this, because the directory picker
+   * bounds only what a browser may *choose*: a creation request names its own
+   * `cwd`, and without this it could name anything on the host.
+   */
+  readonly workspaceRoot?: string | null
+  /**
+   * Whether every Session gets its own `DSH_SESSION_TEMP`.
+   *
+   * On, each model shell call receives the absolute path of
+   * `<session workspace>\sessions\<session id>\temp`, created on first use, so a
+   * Session can write scratch without inventing a directory — and without
+   * putting it in the shared `work\`. Off by default: a deployment that does not
+   * use the project layout would be handing out a directory nobody reads.
+   * @default false
+   */
+  readonly sessionTempDirectory?: boolean | null
+  /**
+   * Whether creating a directory through the browser's picker also creates the
+   * project layout inside it.
+   *
+   * Off by default: it writes to disk, and a deployment that has not decided
+   * where its projects live should not have directories appear in them. The
+   * layout is what makes `work\` meaningful and what carries the rules into the
+   * model's context, so a team deployment turns this on together with
+   * {@link Config.projectsRoot}.
+   * @default false
+   */
+  readonly projectScaffold?: boolean | null
+  /**
+   * The container whose direct children are projects.
+   *
+   * A directory created here gets the layout; one created deeper does not,
+   * because a project inside a project is a mistake rather than a feature.
+   * Defaults to {@link Config.workspaceRoot}, which is where a deployment's
+   * sessions already live; it must stay inside that root, and an invalid value
+   * is reported at startup rather than silently ignored.
+   */
+  readonly projectsRoot?: string | null
+}
+
+/** One member as declared by the operator. */
+export interface TeamMemberConfig {
+  /** Stable id recorded on every action this member performs. */
+  readonly userId?: string | null
+  /** Display name the member signs in with. */
+  readonly name?: string | null
+  /** Code only this member should know. */
+  readonly signInCode?: string | null
+  /** Shared code that admits any member who is not given a personal one. */
+  readonly alternateSignInCode?: string | null
+}
+```
+
+Source: [`packages/identity/team-identity/src/index.ts:97`](../packages/identity/team-identity/src/index.ts)
 
 <a id="deepseek-aidsh-terminal-bash"></a>
 

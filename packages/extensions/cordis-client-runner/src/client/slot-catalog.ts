@@ -1148,6 +1148,7 @@ export const CLIENT_SLOT_API: readonly ClientSlotEntry[] = [
     declaredBy: 'an entry in \'conversation.session.header\' (client-ui-conversation), so it exists while that entry is mounted',
     occupants: [
       'client-ui-agent-preset AgentPresetLabel id \'agent-preset\'',
+      'client-ui-deliverables TeamSurfaceActions id \'team-surface\'',
       'client-ui-jobs JobListAction id \'job-list\'',
       'client-ui-schedule ScheduleCatalogAction id \'schedule-catalog\'',
       'client-ui-sidebar-terminal TerminalRecovery',

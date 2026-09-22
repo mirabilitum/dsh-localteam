@@ -10,6 +10,7 @@
     "src/api-request-trust.ts",
     "src/browser-auth.ts",
     "src/http-bridge.ts",
+    "src/identity.ts",
     "src/index.ts",
     "src/loopback-hostname.ts",
     "src/recovery-config.ts",

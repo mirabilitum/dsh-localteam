@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
+import { runWithRemoteCaller } from '@deepseek-ai/dsh-api-gateway'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import type { Scope } from '@deepseek-ai/dsh-scope'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -323,6 +324,29 @@ describe('CommandRuntime', () => {
     expect(agent.session.snapshotEvents().map(event => event.type)).toEqual([
       'command/run', 'command/done',
     ])
+  })
+
+  it('records the member the transport resolved, and nobody when it could not', async () => {
+    // `/permission` is a command, so the lifecycle record is what makes a policy
+    // change attributable afterwards. The issuer is the transport's answer, read
+    // from the invocation — never a payload field.
+    const attributed = await mount()
+    const first = await mintAgentScope(attributed, 'a')
+    attributed.commands.register(command('deploy', 'deployed'))
+    await runWithRemoteCaller(
+      { userId: 'u-alice', tokenId: 't-1', actorType: 'user' },
+      () => attributed.commands.execute(first.agent, '/deploy', [], new AbortController().signal),
+    )
+    expect(lifecycleOf(first.agent)[0]).toMatchObject({
+      data: { source: { kind: 'user', teamUserId: 'u-alice' } },
+    })
+
+    // A deployment without identity records no issuer rather than inventing one.
+    const anonymous = await mount()
+    const second = await mintAgentScope(anonymous, 'b')
+    anonymous.commands.register(command('deploy', 'deployed'))
+    await anonymous.commands.execute(second.agent, '/deploy', [], new AbortController().signal)
+    expect(lifecycleOf(second.agent)[0]?.data).not.toHaveProperty('source.teamUserId')
   })
 
   it('preserves an earlier authoritative domain-event reference on successful settlement', async () => {

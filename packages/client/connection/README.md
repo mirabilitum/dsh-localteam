@@ -15,6 +15,7 @@ The package carries browser-to-Host Remote calls, exact Fetch responses, and con
 
 - [Use this package](#use-this-package)
 - [Browser authentication and request trust](#browser-authentication-and-request-trust)
+- [Caller identity](#caller-identity)
 - [Connection generation](#connection-generation)
 - [Model Experience](#model-experience)
 - [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
@@ -37,6 +38,22 @@ Every Host RPC method and WebSocket stream requires one browser session; there i
 The cookie signing secret is the owner-scoped `client-connection/browser-session` grant record in `ctx.credentials`. The local provider persists it in `$DSH_HOME/.credentials.yaml`; `BrowserAuth` loads or creates the record during Connection activation and retains the secret in memory, so request authentication is synchronous. Deleting or replacing the record takes effect on the next Connection activation. Cookies carry an absolute issue/expiry interval, defaulting to 30 days through `cookieMaxAgeDays`, and bind the normalized hostname plus port in both their deterministic name and signed payload. They are host-only, `Path=/`, `HttpOnly`, and `SameSite=Strict`; they deliberately omit `Secure` because the shipped server uses loopback HTTP.
 
 Before authentication, every request still passes `src/api-request-trust.ts`. Its `Host` must be loopback or match a `trustedHosts` entry: exact on `host:port`, any port on port-less entries, both sides WHATWG-normalized. An attached `Origin` must equal that Host and `sec-fetch-site: cross-site` is refused. Malformed configured authorities fail plugin load. These checks defend DNS rebinding and cross-site browser requests; they never establish identity. A failed Host/Origin check returns 403, while a trusted but unauthenticated request returns 401. `dsh web --host 0.0.0.0` remains unsupported. Decision records: [browser request trust](../../../.agents/notes/implemented/architecture/2026-07-28-api-browser-trust-boundary.md) and [browser token authentication](../../../.agents/notes/implemented/architecture/2026-08-24-browser-token-authentication.md).
+
+## Caller identity
+
+Authentication above answers "may this request proceed". A deployment may additionally answer "who is calling", and `client-connection` is where that answer is resolved, because the transport is the only layer that sees a request's own cookies before any business method runs.
+
+A deployment installs a resolver through `ctx.connection.setIdentityResolver`. The resolver is synchronous and sees the request's headers alone, so it can read a signed cookie but cannot be told an identity by the caller. Absent a resolver no subject exists, which is the single-user baseline, and nothing else changes: the fence still applies, and `requestRejection` keeps its exact meaning. `authenticate` splits the fence status from the identity read while returning the same status the fence always returned.
+
+The resolved subject reaches the three carriers:
+
+- **Unary RPC** carries it to the endpoint handler and to `InvokeRemoteRequest`.
+- **Raw uploads** receive the identity the `/api` route already resolved, through the bridge.
+- **WebSocket upgrades** record it on the physical socket so every logical stream inherits it, which is also what makes revocation actionable: `RemoteStreamMuxServer.closeSubject` ends the sockets a disabled account still holds.
+
+The browser sends a page instance id in the `x-dsh-client-instance` header on every RPC call. It is correlation rather than identity — the member always comes from the resolver's signed cookie — and it exists so a control decision can tell two tabs of the same member apart. A request that omits it, repeats it, or inflates it past the accepted bound still resolves its member; it simply cannot be distinguished from another tab. An id the resolver already decided is left alone.
+
+The shared Fetch dispatcher performs no fencing of its own: the `/api` Web route authenticates once and passes the subject down, and a route reached without that step still resolves from its own headers.
 
 <a id="connection-generation"></a>
 ## Connection generation

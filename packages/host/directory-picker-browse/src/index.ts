@@ -4,28 +4,52 @@
  * creation over the host filesystem via Node's stdlib (which already carries
  * the per-OS adaptation). Nothing renders on the host display, so this backend
  * serves remote clients the dialog backend cannot. Policy decisions (hidden
- * entries flagged but returned, symlinks followed, whole-filesystem scope) are
- * recorded in the directory-picker seam Agent Note.
+ * entries flagged but returned, symlinks followed) are recorded in the
+ * directory-picker seam Agent Note; the scope is the whole filesystem unless
+ * `root` confines it, which is how a deployment serves browsers it does not
+ * control without handing them every directory on the host.
  * @module @deepseek-ai/dsh-host-directory-picker-browse
  */
 
-import { mkdir, opendir, stat } from 'node:fs/promises'
+import { mkdir, opendir, realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, dirname, join, posix, resolve, win32 } from 'node:path'
+import { basename, dirname, join, posix, resolve, sep, win32 } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import {
   DirectoryPicker, DirectoryPickerError,
 } from '@deepseek-ai/dsh-host-directory-picker'
 import type {
-  DirectoryEntry, DirectoryListing, DirectoryPickerCapability,
+  DirectoryEntry, DirectoryListing, DirectoryPickerCapability, DirectoryPickerErrorCode,
 } from '@deepseek-ai/dsh-host-directory-picker'
 
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /**
+     * One directory was just created, and the create call is waiting for this to
+     * finish before it returns.
+     *
+     * Dispatched with `ctx.parallel` rather than `ctx.emit` on purpose: a
+     * deployment that gives new projects a layout has to have that layout on
+     * disk by the time the browser's create call returns, or the very next
+     * Session can be created in a directory with no rules in it. The dispatcher
+     * contains a listener's failure — the directory exists either way, so a
+     * refused post-create step must not be reported as a failed create.
+     * @param target - absolute path of the directory that was created.
+     * @mode parallel
+     */
+    'directory-picker/created'(target: string): void
+  }
+}
+
 /**
- * Ancestor chain from the filesystem root to `target` inclusive — the
- * breadcrumb rows of a listing, every one a jump target.
+ * Ancestor chain from the filesystem root — or from `stopAt` — to `target`
+ * inclusive: the breadcrumb rows of a listing, every one a jump target.
+ * @param target - the directory being listed.
+ * @param stopAt - highest ancestor to include; omitted walks to the filesystem root.
+ * @returns the chain, root-first.
  */
-function ancestryCrumbs(target: string): DirectoryEntry[] {
+function ancestryCrumbs(target: string, stopAt?: string): DirectoryEntry[] {
   const crumbs: DirectoryEntry[] = []
   let current = target
   for (;;) {
@@ -33,8 +57,22 @@ function ancestryCrumbs(target: string): DirectoryEntry[] {
     // basename of a root is '' — label the root crumb by its full path ('/', 'C:\').
     crumbs.unshift({ name: parent === current ? current : basename(current), path: current, hidden: false })
     if (parent === current) return crumbs
+    if (stopAt !== undefined && current === stopAt) return crumbs
     current = parent
   }
+}
+
+/**
+ * Whether `candidate` is `root` itself or lies beneath it.
+ *
+ * Both arguments must already be canonical: a symlink inside the root that
+ * points outside it would otherwise pass a purely lexical check.
+ * @param root - canonical root directory.
+ * @param candidate - canonical candidate path.
+ * @returns whether the candidate stays inside the root.
+ */
+function containsDirectory(root: string, candidate: string): boolean {
+  return candidate === root || candidate.startsWith(root.endsWith(sep) ? root : root + sep)
 }
 
 /**
@@ -177,10 +215,22 @@ async function directoryRow(
   return { name, path, hidden: name.startsWith('.') }
 }
 
+/** Complete-result bound of one listing level when a deployment states none. */
+const DEFAULT_MAX_ENTRIES = 1000
+
 /** Validated plugin configuration. */
 export interface Config {
-  /** Complete-result bound of one listing level; see {@link BrowseDirectoryPicker.Config}. */
-  maxEntries: number
+  /** Complete-result bound of one listing level; see {@link BrowseDirectoryPicker.Config}. @default DEFAULT_MAX_ENTRIES */
+  maxEntries?: number | null
+  /**
+   * Directory the whole interaction is confined to.
+   *
+   * Omitted means the backend keeps the seam's whole-filesystem scope, which is
+   * right for a loopback-only host whose chooser serves the person at the
+   * console. A deployment that serves browsers it does not control sets this so
+   * a remote visitor cannot make any directory on the host their workspace.
+   */
+  root?: string | null
 }
 
 /** The `ctx.directoryPicker` browse implementation (stable capability object per service life). */
@@ -190,10 +240,11 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
    * materialize and put on the wire: at most this many child-directory rows
    * (hidden rows included), with `truncated` flagging a cut level. The
    * default follows GitHub's web UI, which truncates directory listings at
-   * 1,000 entries.
+   * 1,000 entries. `root` confines the whole interaction when set.
    */
   static Config: z<Config> = z.object({
-    maxEntries: z.natural().min(1).default(1000),
+    maxEntries: z.natural().min(1).default(DEFAULT_MAX_ENTRIES),
+    root: z.string(),
   })
 
   private readonly browseCapability: DirectoryPickerCapability = {
@@ -202,8 +253,17 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
     createDirectory: (path, name) => this.createDirectory(path, name),
   }
 
+  /** Resolved level bound; the schema default is the usual source. */
+  private readonly maxEntries: number
+
+  /** Memoized canonical `root`; undefined when no root is configured. */
+  private rootPath: Promise<string> | undefined
+
   constructor(ctx: Context, private readonly config: Config) {
     super(ctx)
+    // The schema already filled this; the fallback covers a hand-built tree that
+    // bypassed it, so the class never reads a bound that could be undefined.
+    this.maxEntries = config.maxEntries ?? DEFAULT_MAX_ENTRIES
   }
 
   /**
@@ -214,15 +274,68 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
     return this.browseCapability
   }
 
+  /**
+   * Canonical configured root, or undefined when the deployment set none.
+   *
+   * Canonical, not as written: the confinement below compares real paths, and a
+   * textual root would be escaped by any symlinked ancestor. The resolution is
+   * memoized on success only — an operator who creates a missing root should not
+   * have to restart the process.
+   * @returns the canonical root, or undefined for an unfenced deployment.
+   */
+  private async resolveRoot(): Promise<string | undefined> {
+    const configured = this.config.root
+    if (configured === undefined || configured === null || configured === '') return undefined
+    this.rootPath ??= realpath(resolve(configured)).catch((error: unknown) => {
+      this.rootPath = undefined
+      throw new DirectoryPickerError(
+        'directory-unreadable', configured, `configured root "${configured}" cannot be resolved: ${messageOf(error)}`,
+      )
+    })
+    return await this.rootPath
+  }
+
+  /**
+   * Canonicalize one path and refuse it when it leaves the configured root.
+   *
+   * An unfenced deployment gets the path back exactly as resolved, so the
+   * whole-filesystem behavior is unchanged in both value and failure mode.
+   * @param target - the resolved path to check.
+   * @param requested - the path as the caller named it, for the error message.
+   * @param code - error code the caller's operation reports.
+   * @param action - leading verb of the error message.
+   * @returns the canonical path, or the resolved one when nothing is configured.
+   */
+  private async confine(
+    target: string, requested: string, code: DirectoryPickerErrorCode, action: string,
+  ): Promise<string> {
+    const root = await this.resolveRoot()
+    if (root === undefined) return target
+    let canonical: string
+    try {
+      canonical = await realpath(target)
+    } catch (error: unknown) {
+      throw new DirectoryPickerError(code, requested, `${action} ${requested}: ${messageOf(error)}`)
+    }
+    if (!containsDirectory(root, canonical)) {
+      throw new DirectoryPickerError(code, requested, `${action} ${requested}: outside the configured root ${root}`)
+    }
+    return canonical
+  }
+
   private async list(path?: string, signal?: AbortSignal): Promise<DirectoryListing> {
-    const home = homedir()
+    const root = await this.resolveRoot()
     // The seam contract takes fully qualified paths only; resolve() would
     // silently rebase a relative or empty wire value under the host process
     // cwd (or, for rooted drive-less Windows forms, its current drive).
     if (path !== undefined && !fullyQualified(path)) {
       throw new DirectoryPickerError('directory-unreadable', path, `cannot list "${path}": not a fully qualified path`)
     }
-    const target = resolve(path ?? home)
+    // An unfenced deployment opens on the operator's home; a fenced one opens on
+    // the fence, so the first listing is already inside it and the browser's
+    // home affordance cannot point outside.
+    const home = root ?? homedir()
+    const target = await this.confine(resolve(path ?? home), path ?? home, 'directory-unreadable', 'cannot list')
     // Stream the level (opendir, one dirent at a time) into a name-sorted
     // window of maxEntries + 1 candidates: memory stays bounded no matter how
     // many children the directory holds, the window keeps the name-sorted
@@ -230,7 +343,7 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
     // window candidate that turns out non-enterable (broken symlink) is not
     // backfilled from beyond the window — an eviction already marks the
     // level truncated, which stays the honest answer.
-    const keep = this.config.maxEntries + 1
+    const keep = this.maxEntries + 1
     const window: ListingCandidate[] = []
     let evicted = false
     try {
@@ -287,13 +400,13 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
       signal?.throwIfAborted()
       const row = await directoryRow(target, candidate.name, candidate.isDirectory, candidate.isSymbolicLink, signal)
       if (row === null) continue
-      if (entries.length === this.config.maxEntries) {
+      if (entries.length === this.maxEntries) {
         truncated = true
         break
       }
       entries.push(row)
     }
-    return { path: target, home, crumbs: ancestryCrumbs(target), entries, truncated }
+    return { path: target, home, crumbs: ancestryCrumbs(target, root), entries, truncated }
   }
 
   private async createDirectory(path: string, name: string): Promise<string> {
@@ -302,7 +415,9 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
     if (!fullyQualified(path)) {
       throw new DirectoryPickerError('directory-create-failed', path, `cannot create under "${path}": not a fully qualified parent path`)
     }
-    const parent = resolve(path)
+    // The parent is confined before the child is named, so a fenced deployment
+    // cannot be walked out of one segment at a time.
+    const parent = await this.confine(resolve(path), path, 'directory-create-failed', 'cannot create under')
     // The backend owns segment validation; the Remote controller also refuses
     // invalid wire input, but direct service consumers must hit the same fence.
     if (name.trim() === '' || name === '.' || name === '..' || /[/\\]/.test(name)) {
@@ -313,12 +428,31 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
       // Non-recursive: the parent is the directory the browser is showing, so
       // a missing parent is a real failure, not a level to invent.
       await mkdir(target)
-      return target
     } catch (error: unknown) {
       if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'EEXIST') {
         throw new DirectoryPickerError('directory-exists', target, `${target} already exists`)
       }
       throw new DirectoryPickerError('directory-create-failed', target, `cannot create ${target}: ${messageOf(error)}`)
+    }
+    await this.announceCreated(target)
+    return target
+  }
+
+  /**
+   * Wait for the deployment's post-create step, if it has one.
+   *
+   * Awaited, not fired and forgotten: the caller's next move is to select this
+   * directory as a Session's workspace, and a project layout that lands after
+   * that would be a project without rules. A listener that fails is logged and
+   * swallowed — the directory is already there, and reporting it as a failed
+   * create would be a lie the user cannot act on.
+   * @param target - absolute path of the directory that was created.
+   */
+  private async announceCreated(target: string): Promise<void> {
+    try {
+      await this.ctx.parallel('directory-picker/created', target)
+    } catch (error: unknown) {
+      this.ctx.logger.warn(`directory-picker: post-create handling failed for ${target}: ${messageOf(error)}`)
     }
   }
 }

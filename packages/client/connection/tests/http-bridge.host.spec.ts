@@ -25,6 +25,7 @@ describe('HTTP bridge abort', () => {
 
     await bridge(request, response, {
       requestBodyMode: () => 'buffered',
+      subjectOf: () => undefined,
       fetch: () => { throw new Error('a rejected request must never reach the handler') },
     }, 1000)
     // The socket must not stay parked draining a body the client can trickle
@@ -57,6 +58,7 @@ describe('HTTP bridge abort', () => {
     let carrierSignal: AbortSignal | undefined
     const pending = bridge(request, response, {
       requestBodyMode: () => 'buffered',
+      subjectOf: () => undefined,
       fetch: async (input) => {
         const fetchRequest = input
         carrierSignal = fetchRequest.signal
@@ -99,6 +101,7 @@ describe('HTTP bridge abort', () => {
     const received: Uint8Array[] = []
     const pending = bridge(request, response, {
       requestBodyMode: () => 'streaming',
+      subjectOf: () => undefined,
       fetch: async (input) => {
         resolveStarted()
         if (input.body === null) throw new Error('streaming request lost its body')
@@ -138,6 +141,7 @@ describe('HTTP bridge abort', () => {
 
     await bridge(request, response, {
       requestBodyMode: () => 'streaming',
+      subjectOf: () => undefined,
       fetch: () => Promise.resolve(new Response(null, { status: 415 })),
     }, 1)
     expect(status).toBe(415)

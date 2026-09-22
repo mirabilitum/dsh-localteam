@@ -93,6 +93,13 @@ async function request(port: number, path: string, init?: RequestInit): Promise<
   }
 }
 
+/** Read one response's cache directives without consuming it as a body assertion. */
+async function cacheControlOf(port: number, path: string, init?: RequestInit): Promise<string | null> {
+  const response = await fetch(`http://127.0.0.1:${String(port)}${path}`, init)
+  await response.arrayBuffer()
+  return response.headers.get('cache-control')
+}
+
 describe('real Loader composition', () => {
   it('serves explicit index entries and files while preserving HTTP error semantics', { timeout: 60_000 }, async () => {
     const loaded = await loadComposition()
@@ -155,6 +162,14 @@ describe('real Loader composition', () => {
     })
     untap()
     expect((await request(port, '/', authenticated())).body).not.toContain('__T__')
+
+    // The entry document names module revisions that belong to this process, so a
+    // stored copy would send a browser after revisions this process refuses; the
+    // assets beside it stay cacheable on their own terms.
+    for (const path of ['/', '/index.html']) {
+      expect(await cacheControlOf(port, path, authenticated())).toBe('no-store')
+    }
+    expect(await cacheControlOf(port, '/app.js')).toBeNull()
 
     // A missing configured index follows the same empty-404 contract for both
     // of its public entry paths and for both supported methods.

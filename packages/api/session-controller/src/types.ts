@@ -378,6 +378,20 @@ declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     /** Browser prompt correlation and optional Host-validated time zone. */
     'user-rpc': { kind: 'user'; rpcId: SessionRequestId; clientTimeZone?: string }
+    /**
+     * The same prompt, sent by a caller the Host could name.
+     *
+     * Recorded so the transcript can answer who sent it. A browser never supplies
+     * this: the transport resolves the member from the request's own cookie and
+     * hands it to the invocation, and an unauthenticated deployment leaves it off
+     * rather than inventing an author.
+     */
+    'user-team': {
+      kind: 'user'
+      rpcId: SessionRequestId
+      clientTimeZone?: string
+      teamUserId: string
+    }
   }
 }
 

@@ -73,6 +73,15 @@ export interface CommandDescriptor {
  */
 export interface CommandSourceMap {
   user: { kind: 'user' }
+  /**
+   * The same command line, issued by a caller the Host could name.
+   *
+   * Recorded so a policy change made through the command channel can be
+   * attributed afterwards. A browser never supplies this: the transport resolves
+   * the member from the request's own cookie and hands it to the invocation, and
+   * an unauthenticated deployment leaves it off rather than inventing an issuer.
+   */
+  'user-team': { kind: 'user'; teamUserId: string }
 }
 
 /** The union over {@link CommandSourceMap} — who issued a command line. */

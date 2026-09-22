@@ -1,4 +1,4 @@
-/**
+﻿/**
  * The web app's command-line provider: it parses the `dsh --profile web` flag
  * family (`--host`, `--port`, `--trusted-host`, `--no-open`) and its `--help`
  * text, then provides the immutable values as {@link WEB_STARTUP_SERVICE}.
@@ -48,7 +48,7 @@ function webCommand(): Command {
     .name('dsh --profile web')
     .description('Serve the DeepSeek Harness browser UI.')
     .helpOption('-h, --help', 'show this help')
-    .option('--host <host>', 'bind host')
+    .option('--host <host>', 'bind host: 127.0.0.1, or one specific interface address to serve a network')
     .option('--no-open', 'do not open the Web UI in the default browser')
     .option('--port <port>', 'listen port; pass 0 to let the OS pick a free one')
     .option('--trusted-host <authority...>', 'extra authority the /api browser-trust fence accepts (host or host:port; repeatable)')
@@ -57,6 +57,8 @@ Examples:
   dsh --profile web                          serve on the composed host and port
   dsh --profile web --no-open                serve without opening a browser
   dsh --profile web --port 8080              serve on another port
+  dsh --profile web --host 192.0.2.10 --trusted-host 192.0.2.10:3080
+                                             serve one network address to a LAN
 `)
 }
 
@@ -72,7 +74,10 @@ export function apply(ctx: Context): void {
   program.action(() => {
     const options = program.opts<WebOptions>()
     if (options.host === '0.0.0.0') {
-      program.error('error: --host 0.0.0.0 is intentionally not supported yet for safety: it would expose remote code execution to the network; use 127.0.0.1 instead')
+      program.error(
+        'error: --host 0.0.0.0 is intentionally not supported yet for safety: it would expose remote code execution to the network; '
+        + 'name the one interface to serve instead, e.g. --host 192.168.1.10 --trusted-host 192.168.1.10:3080',
+      )
     }
     if (options.port !== undefined && !/^\d+$/.test(options.port)) {
       program.error(`error: --port must be a number, got ${JSON.stringify(options.port)}`)

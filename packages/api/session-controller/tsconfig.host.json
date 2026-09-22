@@ -28,6 +28,7 @@
     { "path": "../../core/agent-default-model" },
     { "path": "../../core/scope" },
     { "path": "../../core/session" },
+    { "path": "../gateway/tsconfig.host.json" },
     { "path": "../../context/file-reference" },
     { "path": "../../attachment/attachment" },
     { "path": "../../client/file-upload/tsconfig.host.json" },

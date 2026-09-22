@@ -141,9 +141,18 @@ describe('web command-line provider', () => {
 
   it('rejects the intentionally unsupported all-interfaces host before the consumer activates', async () => {
     const { values, observed } = await bootProvider(['--host', '0.0.0.0'])
-    expect(observed.out).toContain('--host 0.0.0.0 is intentionally not supported yet for safety: it would expose remote code execution to the network; use 127.0.0.1 instead')
+    expect(observed.out).toContain('--host 0.0.0.0 is intentionally not supported yet for safety: it would expose remote code execution to the network')
+    // The refusal points at the supported alternative rather than only at loopback:
+    // serving one named interface is what a LAN deployment actually needs.
+    expect(observed.out).toContain('--host 192.168.1.10 --trusted-host 192.168.1.10:3080')
     expect(values).toBeUndefined()
     expect(observed.readerConfig).toBeUndefined()
     expect(observed.exits).toEqual([1])
+  })
+
+  it('accepts one named interface address so a deployment can serve a LAN', async () => {
+    const { values, observed } = await bootProvider(['--host', '192.168.1.10', '--trusted-host', '192.168.1.10:3080'])
+    expect(values).toMatchObject({ host: '192.168.1.10', trustedHosts: ['192.168.1.10:3080'] })
+    expect(observed.exits).toEqual([])
   })
 })

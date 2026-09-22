@@ -15,6 +15,7 @@ kind: "package-reference"
 
 - [使用本包](#use-this-package)
 - [浏览器认证与请求信任](#browser-authentication-and-request-trust)
+- [调用者身份](#caller-identity)
 - [Connection generation](#connection-generation)
 - [模型体验](#model-experience)
 - [已知限制与暂缓事项](#known-limitations-and-deferred-work)
@@ -37,6 +38,23 @@ kind: "package-reference"
 cookie 签名密钥是 `ctx.credentials` 中由 `client-connection/browser-session` 拥有的 grant 记录。本地提供方把它持久化到 `$DSH_HOME/.credentials.yaml`；`BrowserAuth` 在 Connection 激活期间加载或创建该记录，并把密钥留在内存中，因此请求认证同步执行。删除或替换该记录会在下一次 Connection 激活时生效。cookie 携带绝对签发与过期区间，`cookieMaxAgeDays` 默认设为 30 天，并在确定性名称与签名 payload 中同时绑定规范化 hostname 和 port。它是 host-only、`Path=/`、`HttpOnly`、`SameSite=Strict`；随附服务器使用 loopback HTTP，因此刻意不设置 `Secure`。
 
 认证之前，每个请求仍经过 `src/api-request-trust.ts`。其 `Host` 必须是 loopback，或与 `trustedHosts` 条目匹配：带端口的 `host:port` 精确匹配，不带端口的条目匹配任意端口，两侧均经 WHATWG 归一化。若附带 `Origin`，它必须等于该 Host；`sec-fetch-site: cross-site` 一律拒绝。畸形配置 authority 会让插件加载失败。这些检查防御 DNS rebinding 与跨站浏览器请求，绝不建立身份。Host/Origin 校验失败返回 403；Host 可信但未认证的请求返回 401。`dsh web --host 0.0.0.0` 仍不受支持。决策记录：[浏览器请求信任](../../../.agents/notes/implemented/architecture/2026-07-28-api-browser-trust-boundary.zh.md)与[浏览器令牌认证](../../../.agents/notes/implemented/architecture/2026-08-24-browser-token-authentication.zh.md)。
+
+<a id="caller-identity"></a>
+## 调用者身份
+
+上面的认证回答的是"这个请求能否继续"。部署**还可以**回答"是谁在调用"，而解析这个答案的地方就是 `client-connection`——因为传输层是唯一在任何业务方法运行之前就能看到请求自身 cookie 的一层。
+
+部署通过 `ctx.connection.setIdentityResolver` 安装解析器。解析器是**同步**的，且**只看请求头**，因此它能读取签名 cookie，但**不可能被调用方告知身份**。没有解析器时不存在主体，这就是单用户基线，别的一切都不变：栅栏照常生效，`requestRejection` 的含义一字不改。`authenticate` 只是把栅栏判定与身份读取拆开，返回的状态仍然是栅栏原本会给的那个。
+
+解析出的主体会到达三条通道：
+
+- **一元 RPC** 把它传给端点处理器与 `InvokeRemoteRequest`。
+- **原始上传**通过 bridge 收到 `/api` 路由已经解析好的身份。
+- **WebSocket 升级**把它记在**物理连接**上，于是每个逻辑流都继承它——这也正是吊销可实施的前提：`RemoteStreamMuxServer.closeSubject` 能关掉停用账号仍握着的那些连接。
+
+浏览器在每次 RPC 调用上通过 `x-dsh-client-instance` 头带上**页面实例 id**。它是**关联信息而非身份**——成员永远来自解析器读到的签名 cookie——它存在的意义是让控制权判定能区分同一成员的两个标签页。省略它、重复它、或把它撑过可接受长度的请求，**仍然能正常解析出成员**，只是无法与另一个标签页区分。解析器已经决定好的实例 id 不会被覆盖。
+
+共享 Fetch 分发器**自身不做栅栏**：`/api` 的 Web 路由认证一次并把主体传下去；而未经那一步到达的路由仍会从自己的请求头解析。
 
 <a id="connection-generation"></a>
 ## Connection generation

@@ -7,7 +7,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { Context, Service, symbols } from '@deepseek-ai/cordis'
-import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
+import type { ConnectionRpcHandler, ConnectionSubject } from '@deepseek-ai/dsh-client-connection'
 import { Deque } from '@deepseek-ai/dsh-deque'
 import type { WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
@@ -24,6 +24,9 @@ import {
 } from '@deepseek-ai/dsh-typert-protocol'
 import type {
   InvokeRemoteRequest,
+  RemoteCallPolicy,
+  RemoteEventAnswerPolicy,
+  RemoteEventOwnerResolver,
   TypertGateway,
   TypertGatewayErrorCode,
   TypertGatewayWireStream,
@@ -37,6 +40,7 @@ import {
   RemoteStreamMuxServer,
   rejectRemoteStreamUpgrade,
 } from './stream-server.ts'
+import { runWithRemoteCaller } from './caller.ts'
 import {
   REMOTE_EVENT_STREAM_ENDPOINT,
   REMOTE_EVENT_STREAM_READY,
@@ -59,6 +63,10 @@ import {
 
 export type {
   InvokeRemoteRequest,
+  RemoteCallContext,
+  RemoteCallPolicy,
+  RemoteEventAnswerPolicy,
+  RemoteEventOwnerResolver,
   TypertGateway,
   TypertGatewayErrorCode,
   TypertGatewayWireStream,
@@ -70,10 +78,13 @@ export type {
   TypertRemoteEventSource,
 } from './types.ts'
 export type { RemoteEventHostInfo } from './stream-protocol.ts'
+export { remoteCaller, runWithRemoteCaller } from './caller.ts'
 
 interface GatewayErrorOptions {
   readonly cause?: unknown
   readonly field?: string
+  /** Extra boundary facts merged into the failure details the caller receives. */
+  readonly details?: object
 }
 
 interface ResolvedBinding {
@@ -99,12 +110,24 @@ interface RemoteEventClient {
   readonly id: RemoteEventClientId
   readonly queue: RemoteEventQueue
   readonly deliveries: Map<RemoteEventId, PendingRemoteEvent>
+  /**
+   * Identity recorded when this event stream was opened, if the deployment has
+   * one. Undefined means single-user mode, where every authenticated browser is
+   * the same caller and filtering would only break delivery.
+   */
+  readonly subject: ConnectionSubject | undefined
 }
 
 interface PendingRemoteEvent {
   readonly id: RemoteEventId
   readonly source: TypertRemoteEventInvocation
   readonly frame: RemoteEventInvocationFrame
+  /**
+   * Who this interaction request belongs to, when the deployment resolves
+   * identity. The requester's answer must come back from this same caller.
+   * Reassigned in place when control of the conversation moves.
+   */
+  owner: ConnectionSubject | undefined
   readonly deliveries: Set<RemoteEventClient>
   releaseContext: () => void
   releaseSignal: () => void
@@ -152,7 +175,11 @@ export class TypertGatewayError extends RemoteError<TypertGatewayErrorCode> {
     super(
       code,
       `typert gateway: ${endpoint}: ${message}`,
-      { endpoint, ...options.field === undefined ? {} : { field: options.field } },
+      {
+        endpoint,
+        ...options.field === undefined ? {} : { field: options.field },
+        ...options.details ?? {},
+      },
       options.cause === undefined ? undefined : { cause: options.cause },
     )
     this.name = 'TypertGatewayError'
@@ -175,12 +202,17 @@ export class TypertGatewayService extends Service implements TypertGateway {
 
   /** Carrier adapter shared by the WebSocket mux and local Host transports. */
   readonly wireStream: TypertGatewayWireStream = {
-    open: (endpoint, payload, signal) => this.openWireStream(endpoint, payload, signal),
+    open: (endpoint, payload, signal, subject) =>
+      this.openWireStream(endpoint, payload, signal, subject),
     failure: error => rpcError(error),
   }
 
   private srcClaims: ReadonlySet<string> | undefined
   private remoteEvents: RegisteredRemoteEventSource | undefined
+  private streamMux: RemoteStreamMuxServer | undefined
+  private callPolicy: RemoteCallPolicy | undefined
+  private eventOwnerResolver: RemoteEventOwnerResolver | undefined
+  private eventAnswerPolicy: RemoteEventAnswerPolicy | undefined
   private readonly remoteEventClients = new Map<RemoteEventClientId, RemoteEventClient>()
   private readonly pendingRemoteEvents = new Map<RemoteEventId, PendingRemoteEvent>()
 
@@ -195,38 +227,183 @@ export class TypertGatewayService extends Service implements TypertGateway {
     ctx.on('internal/service', () => {
       this.srcClaims = undefined
     })
+    // Revocation reaches established connections here: the identity owner
+    // decides who is disabled, this transport decides which sockets that user
+    // is holding. Listening keeps the two packages independent.
+    ctx.on('identity/revoked', (userId: string) => {
+      this.closeSubjectStreams(userId)
+    })
     ctx.inject(['connection'], (connectionCtx) => {
       connectionCtx.connection.rpc.intercept(
         '/api',
         endpoint => this.claimsEndpoint(endpoint),
-        (endpoint, payload, signal) => this.dispatchRpc(endpoint, payload, signal),
+        (endpoint, payload, signal, subject) => this.dispatchRpc(endpoint, payload, signal, subject),
       )
     })
     ctx.inject(['connection', 'webServer'], (webCtx) => {
       const mux = new RemoteStreamMuxServer(
-        (endpoint, payload, signal) => this.openWireStream(endpoint, payload, signal),
+        (endpoint, payload, signal, subject) =>
+          this.openWireStream(endpoint, payload, signal, subject),
         this.wireStream.failure,
         resolved.websocketHeartbeatIntervalMs,
       )
+      // The acceptor is reachable by the team-revocation path, which must be able
+      // to end sockets that were accepted before an account was disabled.
+      this.streamMux = mux
       webCtx.effect(() => {
         const route: WebUpgradeRoute = {
           path: REMOTE_STREAM_MUX_PATH,
           handler: (req, socket, head) => {
-            const rejection = webCtx.connection.requestRejection(req)
-            if (rejection !== undefined) {
-              rejectRemoteStreamUpgrade(socket, rejection)
+            const authentication = webCtx.connection.authenticate(req)
+            if (authentication.rejection !== undefined) {
+              rejectRemoteStreamUpgrade(socket, authentication.rejection)
               return
             }
-            mux.handleUpgrade(req, socket, head)
+            mux.handleUpgrade(req, socket, head, authentication.subject)
           },
         }
         const unregister = webCtx.webServer.registerUpgrade(route)
         return async () => {
           unregister()
+          if (this.streamMux === mux) this.streamMux = undefined
           await mux.close()
         }
       }, `api-gateway: ${REMOTE_STREAM_MUX_PATH} WebSocket`)
     })
+  }
+
+  /**
+   * Terminate every Remote stream socket recorded for one team user.
+   *
+   * Revocation has to reach established connections; the WebSocket generation a
+   * browser already holds is not re-checked per stream.
+   * @param userId - team user whose connections must end.
+   * @returns how many sockets were closed.
+   */
+  closeSubjectStreams(userId: string): number {
+    return this.streamMux?.closeSubject(userId) ?? 0
+  }
+
+  /**
+   * Install the deployment's Remote call policy for the calling fiber's lifetime.
+   *
+   * The transport is the only layer that knows both the caller and the endpoint
+   * before a method runs, so a deployment policy is enforced here rather than in
+   * every business method.
+   */
+  setCallPolicy(policy: RemoteCallPolicy): () => Promise<void> {
+    return this.ctx.effect(() => {
+      this.callPolicy = policy
+      return () => {
+        if (this.callPolicy === policy) this.callPolicy = undefined
+      }
+    }, 'api-gateway: Remote call policy')
+  }
+
+  /**
+   * Install the deployment's interaction-request owner lookup for the calling fiber.
+   */
+  setEventOwnerResolver(resolver: RemoteEventOwnerResolver): () => Promise<void> {
+    return this.ctx.effect(() => {
+      this.eventOwnerResolver = resolver
+      return () => {
+        if (this.eventOwnerResolver === resolver) this.eventOwnerResolver = undefined
+      }
+    }, 'api-gateway: Remote event owner resolver')
+  }
+
+  /**
+   * Install the deployment's admission rule for answers, for the calling fiber.
+   */
+  setEventAnswerPolicy(policy: RemoteEventAnswerPolicy): () => Promise<void> {
+    return this.ctx.effect(() => {
+      this.eventAnswerPolicy = policy
+      return () => {
+        if (this.eventAnswerPolicy === policy) this.eventAnswerPolicy = undefined
+      }
+    }, 'api-gateway: Remote event answer policy')
+  }
+
+  /**
+   * Re-deliver one Agent's outstanding interaction requests to its current owner.
+   *
+   * Withdrawing comes first and is unconditional: the request leaves every holder
+   * before it is offered again, so a controller who lost the conversation cannot
+   * settle it with an answer that was already in flight. An Agent nobody owns is
+   * withdrawn without being cancelled — the Agent is still waiting, and whoever
+   * claims next is offered it — rather than left with a holder who may no longer
+   * answer.
+   */
+  reDeliverRemoteEvents(agentId: string): number {    let moved = 0
+    for (const pending of [...this.pendingRemoteEvents.values()]) {
+      if (pending.frame.agentId !== agentId) continue
+      const previous = [...pending.deliveries]
+      const owner = this.eventOwnerResolver?.ownerOf(agentId)
+      if (owner === undefined && previous.length === 0) continue
+      if (owner === undefined) {
+        // Nobody drives this conversation any more. The request is not cancelled —
+        // the Agent is still waiting, and whoever claims next should be offered it
+        // — but every current holder is told to stop waiting, which is the part
+        // that "the controller is gone" has to mean: a holder who was not told
+        // would keep showing a prompt whose answer can no longer settle anything.
+        this.cancelRemoteEventDeliveries(pending, previous)
+        for (const client of previous) this.removeRemoteEventDelivery(pending, client)
+        moved += 1
+        continue
+      }
+      // A request with no holder is offered just the same: it exists precisely
+      // because the Agent is waiting, and the member who just claimed is the one
+      // who can answer it.
+      for (const client of previous) this.removeRemoteEventDelivery(pending, client)
+      this.replaceRemoteEventOwner(pending, owner, previous)
+      moved += 1
+    }
+    return moved
+  }
+
+  /**
+   * Whether one Agent is still waiting on an answer it forwarded.
+   */
+  hasPendingRemoteEvents(agentId: string): boolean {
+    for (const pending of this.pendingRemoteEvents.values()) {
+      if (pending.frame.agentId === agentId) return true
+    }
+    return false
+  }
+
+  /**
+   * Point one pending interaction request at a new owner and offer it again.
+   *
+   * The previous holders are told to stop waiting so a late answer cannot settle
+   * it, and the request is then re-sent to whoever may receive it now. The pending
+   * record is mutated rather than replaced so every holder keeps referring to the
+   * same one.
+   */
+  private replaceRemoteEventOwner(
+    pending: PendingRemoteEvent,
+    owner: ConnectionSubject,
+    previousHolders: readonly RemoteEventClient[],
+  ): void {
+    this.cancelRemoteEventDeliveries(pending, previousHolders)
+    pending.owner = owner
+    for (const client of this.remoteEventClients.values()) this.deliverRemoteEvent(pending, client)
+  }
+
+  /**
+   * Tell holders a delivery is void, so their prompt stops waiting for an answer
+   * that can no longer settle anything.
+   * @param pending - the request whose delivery is being withdrawn.
+   * @param holders - connections to notify.
+   */
+  private cancelRemoteEventDeliveries(
+    pending: PendingRemoteEvent,
+    holders: readonly RemoteEventClient[],
+  ): void {
+    const cancellation: RemoteEventCancellationFrame = {
+      type: 'cancel',
+      eventId: pending.id,
+    }
+    for (const client of holders) client.queue.push(cancellation)
   }
 
   /**
@@ -306,7 +483,13 @@ export class TypertGatewayService extends Service implements TypertGateway {
     }
 
     try {
-      return await Reflect.apply(prepared.method, prepared.receiver, prepared.args) as unknown
+      // The caller travels with the invocation: business code that writes a
+      // durable record has no request to read it from, and attributing one's own
+      // record is not something every method signature should have to carry.
+      return await runWithRemoteCaller(
+        request.subject,
+        () => Reflect.apply(prepared.method, prepared.receiver, prepared.args) as unknown,
+      )
     } catch (error) {
       if (request.signal?.aborted === true) throw remoteCancelled(prepared.endpoint, error)
       throw error
@@ -353,6 +536,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
     endpoint: string,
     payload: unknown,
     signal: AbortSignal,
+    subject?: ConnectionSubject,
   ): Promise<ConnectionRpcResult> {
     if (endpoint === REMOTE_EVENT_RESULT_ENDPOINT) {
       try {
@@ -361,29 +545,31 @@ export class TypertGatewayService extends Service implements TypertGateway {
         if (client === undefined) {
           throw new Error('typert gateway: Remote event result identifies no active event stream')
         }
-        this.receiveRemoteEventResult(client, result)
+        this.receiveRemoteEventResult(client, result, subject)
         return { ok: true, value: undefined }
       } catch (error) {
         return rpcFailure(error)
       }
     }
-    return this.invokeRpc(endpoint, payload, signal)
+    return this.invokeRpc(endpoint, payload, signal, subject)
   }
 
   private async openWireStream(
     endpoint: string,
     payload: unknown,
     signal: AbortSignal,
+    subject?: ConnectionSubject,
   ): Promise<AsyncIterable<unknown>> {
     if (endpoint === REMOTE_EVENT_STREAM_ENDPOINT) {
-      return this.openRemoteEvents(payload, signal)
+      return this.openRemoteEvents(payload, signal, subject)
     }
-    return this.stream(remoteRequest(endpoint, payload, signal))
+    return this.stream(remoteRequest(endpoint, payload, signal, subject))
   }
 
   private async *openRemoteEvents(
     payload: unknown,
     signal: AbortSignal,
+    subject?: ConnectionSubject,
   ): AsyncGenerator<
     RemoteEventEmitFrame | RemoteEventInvocationFrame | RemoteEventCancellationFrame
     | RemoteEventReadyFrame
@@ -416,6 +602,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
       id: clientId,
       queue: new RemoteEventQueue(),
       deliveries: new Map(),
+      subject,
     }
     this.remoteEventClients.set(clientId, client)
     for (const pending of this.pendingRemoteEvents.values()) this.deliverRemoteEvent(pending, client)
@@ -451,7 +638,29 @@ export class TypertGatewayService extends Service implements TypertGateway {
       event: frame.event,
       args: frame.args,
     }
+    // Unscoped notifications carry no owner, so identity cannot narrow them:
+    // shared state and progress stay visible to every authenticated viewer,
+    // which is the collaboration baseline. Owner-scoped interaction requests
+    // take the directed path in startRemoteEvent instead.
     for (const client of this.remoteEventClients.values()) client.queue.push(wire)
+  }
+
+  /**
+   * Decide whether one event client may receive an event owned by `subject`.
+   *
+   * A deployment with no owner resolver has no notion of a caller at all, so
+   * there is nothing to match on and requests fan out as they always have. Once
+   * one is installed the deployment does know its callers, and an unidentifiable
+   * connection must not be a way past the owner filter: "we could not tell who
+   * this is" cannot mean "so they may see everything". An Agent nobody owns yet
+   * is still offered to every member, so a request raised before anyone claimed
+   * the conversation is not lost.
+   */
+  private clientMayReceive(client: RemoteEventClient, owner: ConnectionSubject | undefined): boolean {
+    if (this.eventOwnerResolver === undefined) return true
+    if (client.subject === undefined) return false
+    if (owner === undefined) return true
+    return client.subject.userId === owner.userId
   }
 
   private startRemoteEvent(source: TypertRemoteEventInvocation): void {
@@ -498,6 +707,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
           agentId: source.context.agentId,
           request: projected.request,
         },
+        owner: this.eventOwnerResolver?.ownerOf(source.context.agentId),
         deliveries: new Set(),
         releaseContext,
         releaseSignal: () => {
@@ -514,6 +724,9 @@ export class TypertGatewayService extends Service implements TypertGateway {
   }
 
   private deliverRemoteEvent(pending: PendingRemoteEvent, client: RemoteEventClient): void {
+    // A waterfall request needs an answer from exactly one operator; delivering
+    // it to every viewer would let a bystander answer for someone else.
+    if (!this.clientMayReceive(client, pending.owner)) return
     pending.deliveries.add(client)
     client.deliveries.set(pending.id, pending)
     client.queue.push(pending.frame)
@@ -522,11 +735,25 @@ export class TypertGatewayService extends Service implements TypertGateway {
   private receiveRemoteEventResult(
     client: RemoteEventClient,
     result: ReturnType<typeof parseRemoteEventResult>,
+    subject: ConnectionSubject | undefined,
   ): void {
     const pending = this.pendingRemoteEvents.get(result.eventId)
     // Settlement and Client replacement may race the result request. Results
     // from a completed event or a superseded delivery are idempotent no-ops.
     if (pending === undefined || !pending.deliveries.has(client)) return
+    // Holding the delivery says the request was offered here; it does not say the
+    // caller may settle it. The deployment's rule is asked on the same terms that
+    // routed the request, so a lease that moved — or a page that is no longer the
+    // one holding it — cannot answer through a delivery it still sits on. Refused
+    // loudly rather than ignored: this caller's answer will never settle anything,
+    // and a silent success would leave them believing it had.
+    if (this.eventAnswerPolicy !== undefined && !this.eventAnswerPolicy.accepts(pending.frame.agentId, subject)) {
+      throw new TypertGatewayError(
+        'gateway/refused',
+        REMOTE_EVENT_RESULT_ENDPOINT,
+        'this answer does not come from the conversation’s current controller',
+      )
+    }
     this.removeRemoteEventDelivery(pending, client)
     if (result.outcome.kind === 'result') {
       this.settleRemoteEvent(pending, {
@@ -582,9 +809,14 @@ export class TypertGatewayService extends Service implements TypertGateway {
     for (const client of [...this.remoteEventClients.values()]) client.queue.end()
   }
 
-  private async invokeRpc(endpoint: string, payload: unknown, signal: AbortSignal): Promise<ConnectionRpcResult> {
+  private async invokeRpc(
+    endpoint: string,
+    payload: unknown,
+    signal: AbortSignal,
+    subject?: ConnectionSubject,
+  ): Promise<ConnectionRpcResult> {
     try {
-      const value = await this.invoke(remoteRequest(endpoint, payload, signal))
+      const value = await this.invoke(remoteRequest(endpoint, payload, signal, subject))
       // A void or explicitly absent business result carries no `value` field;
       // JSON has no `undefined`, and the envelope's optional slot is the one
       // representation of absence that both args and results already use.
@@ -598,6 +830,22 @@ export class TypertGatewayService extends Service implements TypertGateway {
     const endpoint = endpointOf(request.namespace, request.method)
     const descriptor = this.resolveDescriptor(request.namespace, request.method, endpoint)
     assertExactArguments(request.args, descriptor, endpoint)
+    // The policy is asked here because this is where the decoded arguments, the
+    // canonical endpoint, and the resolved caller are all in hand — and before
+    // any receiver is resolved, so a refusal cannot have touched business state.
+    const refusal = this.callPolicy?.decide({
+      subject: request.subject,
+      endpoint,
+      args: request.args,
+    })
+    if (refusal !== undefined) {
+      // One transport code for every refusal, with the policy's own reason in the
+      // details: callers can branch on why, and the gateway's closed error
+      // vocabulary stays closed.
+      throw new TypertGatewayError('gateway/refused', endpoint, refusal.message, {
+        details: { policyCode: refusal.code, ...refusal.details },
+      })
+    }
     const receiverContext = await this.resolveReceiverContext(descriptor, request.args, endpoint)
     const receiver = receiverContext.get(descriptor.service) as unknown
     if (!isObject(receiver)) {
@@ -933,7 +1181,12 @@ function parseRemoteEventResultPayload(payload: unknown): ReturnType<typeof pars
   return parseRemoteEventResult(payload.args)
 }
 
-function remoteRequest(endpoint: string, payload: unknown, signal: AbortSignal): InvokeRemoteRequest {
+function remoteRequest(
+  endpoint: string,
+  payload: unknown,
+  signal: AbortSignal,
+  subject?: ConnectionSubject,
+): InvokeRemoteRequest {
   const segments = endpoint.split('/')
   if (segments.length !== 2 || segments[0] === '' || segments[1] === '') {
     throw new Error(`invalid Remote endpoint ${JSON.stringify(endpoint)}`)
@@ -947,7 +1200,7 @@ function remoteRequest(endpoint: string, payload: unknown, signal: AbortSignal):
     || !isPlainObject(payload.args)) {
     throw new Error('Remote payload must contain exactly one plain-object args field')
   }
-  return { namespace, method, args: payload.args, signal }
+  return { namespace, method, args: payload.args, signal, ...subject === undefined ? {} : { subject } }
 }
 
 function isIterable(value: unknown): value is Iterable<unknown> | AsyncIterable<unknown> {

@@ -13,6 +13,7 @@ import type {} from '@deepseek-ai/dsh-client-file-upload'
 import {
   ReasoningEffortId, assistantStreamChunks, createUserMessage, freezeMessage,
 } from '@deepseek-ai/dsh-llm'
+import { remoteCaller } from '@deepseek-ai/dsh-api-gateway'
 import type { MessageSource } from '@deepseek-ai/dsh-llm'
 import { SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionHeader, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
@@ -324,10 +325,16 @@ export class SessionCommandController {
         { provider: selection.provider, model: selection.model },
       )
     }
+    // Who sent this, when the deployment can say. The member is the transport's
+    // answer, read from the invocation this method is running inside — a browser
+    // never supplies it. An unauthenticated deployment leaves it off rather than
+    // recording an author it did not verify.
+    const teamUserId = remoteCaller()?.userId
     const source: MessageSource = {
       kind: 'user',
       rpcId: request.requestId,
       ...(clientTimeZone === undefined ? {} : { clientTimeZone }),
+      ...(teamUserId === undefined ? {} : { teamUserId }),
     }
     const hasImage = request.content.some(part => part.type === 'image')
     const admit = async (): Promise<SessionPromptValue> => {

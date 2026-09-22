@@ -1,6 +1,13 @@
 /** Generic unary RPC contracts shared by the Host and Client Connection halves. */
 
 import type { Branded } from '@deepseek-ai/dsh-brand'
+import type { ConnectionIdentityResolver, ConnectionSubject } from './identity.ts'
+
+export type {
+  ConnectionActorType,
+  ConnectionIdentityResolver,
+  ConnectionSubject,
+} from './identity.ts'
 
 /** Correlation id minted by a caller and echoed by the Connection response. */
 export type RpcId = Branded<'rpc-id'>
@@ -84,6 +91,14 @@ export interface ConnectionTrustRequest {
 /** HTTP status returned before dispatch, or undefined when the request may proceed. */
 export type ConnectionRequestRejection = 401 | 403 | undefined
 
+/** Outcome of a full transport authentication: the fence status plus any resolved identity. */
+export interface ConnectionAuthentication {
+  /** Rejection status this request would receive from the trust fence. */
+  readonly rejection: ConnectionRequestRejection
+  /** Server-resolved caller identity; undefined when the deployment has no resolver or no valid team cookie. */
+  readonly subject: ConnectionSubject | undefined
+}
+
 /** Root/index request facts used by the browser-token exchange. */
 export interface ConnectionIndexRequest extends ConnectionTrustRequest {
   readonly method?: string | undefined
@@ -101,6 +116,8 @@ export type ConnectionRpcHandler = (
   endpoint: string,
   payload: unknown,
   signal: AbortSignal,
+  /** Server-resolved caller identity; undefined when this deployment has no team identity. */
+  subject: ConnectionSubject | undefined,
 ) => Promise<ConnectionRpcResult<unknown>>
 
 /** Synchronous ownership test for one endpoint on a shared RPC channel. */
@@ -184,6 +201,31 @@ export interface HostConnectionHandle {
   requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection
 
   /**
+   * Apply the same trust fence as {@link HostConnectionHandle.requestRejection}
+   * and additionally resolve the caller identity.
+   *
+   * The trust-fence URL prefix runs {@link HostConnectionHandle.requestRejection}
+   * only, so a route that needs the caller's team identity during dispatch (the
+   * shared API channel, the WebSocket upgrade) calls this instead; the rejection
+   * status is the one the fence would have produced, and the acceptance set is
+   * identical.
+   * @param request - request headers from the HTTP or upgrade request.
+   * @returns the rejection status, and the resolved subject when the request may proceed.
+   */
+  authenticate(request: ConnectionTrustRequest): ConnectionAuthentication
+
+  /**
+   * Install the deployment's team-identity resolver.
+   *
+   * Absent a resolver the transport resolves no subject, which is exactly DSH's
+   * single-user behaviour; the shared API channel still requires the browser
+   * cookie either way, so this never widens admission.
+   * @param resolver - resolver owned by the calling fiber.
+   * @returns asynchronous disposer removing this exact resolver.
+   */
+  setIdentityResolver(resolver: ConnectionIdentityResolver): () => Promise<void>
+
+  /**
    * Authenticate one frontend index request, owning a token redirect or 401.
    * @param request - root or configured-index HTTP request.
    * @param response - response owned when the result is false.
@@ -209,11 +251,25 @@ export interface ConnectionFetchHandler {
   requestBodyMode(request: { readonly method: string; readonly url: URL }): ConnectionRequestBodyMode
 
   /**
-   * Dispatch one already-authenticated request.
+   * Dispatch one request below the shared channel.
+   *
+   * Performs no trust fence and no browser authentication: the owning Web route
+   * applies both and delegates here. A caller that already resolved the caller
+   * identity passes it as `subject`; when it does not, this resolves it from the
+   * request's own headers, so a route reached without that step still sees the
+   * right caller.
    * @param request - Fetch request below the shared channel.
+   * @param subject - identity the caller already resolved for this request.
    * @returns the registered response or a 404 response.
    */
-  fetch(request: Request): Promise<Response>
+  fetch(request: Request, subject?: ConnectionSubject): Promise<Response>
+
+  /**
+   * Read the caller identity resolved while dispatching one request.
+   * @param request - the exact request object previously passed to {@link ConnectionFetchHandler.fetch}.
+   * @returns that request's subject, or undefined when none was resolved.
+   */
+  subjectOf(request: Request): ConnectionSubject | undefined
 }
 
 /** Client caller for logical RPC channels carried by the current transport. */

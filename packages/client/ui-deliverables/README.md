@@ -42,6 +42,12 @@ The “Files changed” row lists successful file-tool mutations; final file del
 
 The closing prose links produced or delivered paths: an inline-code token resolves by exact path, or by being exactly the basename of exactly one such path — a basename two paths share stays inert rather than guessing, so a mention can never open the wrong file. A resolved mention keeps its code chip and takes the markdown sheet's link language, with the full path as its title.
 
+### Team controls
+
+On a deployment that serves a shared team, a member's finalized-message action row also carries two controls beside copy and branch: **Download this conversation's output** and **Hand over control**. The first asks the Host what the conversation's project has produced and then saves `work\` as one ZIP — the archive mirrors the server's own layout and holds nothing from `input\`, `build\`, `logs\`, or a session's `temp\`. The second lists the deployment's other members, and also offers releasing control so anyone may take it; the Host admits either only from the member already driving the conversation. Both are plain same-origin HTTP against the Host's team routes, so nothing here needs a Remote or a service: a deployment without those routes answers 404, the plugin reports a single-operator instance, and no control is rendered at all.
+
+Saving is a read. Any signed-in member may save a file they can already see in the preview, and the gesture cannot move control.
+
 -----
 
 <a id="understand-the-implementation"></a>

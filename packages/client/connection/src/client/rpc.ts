@@ -6,11 +6,29 @@ import {
   type RpcId as RpcIdType,
 } from '../rpc.ts'
 import type { ClientConnectionRpc, ConnectionRpcResult } from '../rpc.ts'
+import { CLIENT_INSTANCE_HEADER } from '../identity.ts'
 import { randomUuid } from './random-uuid.ts'
 
 const INTERNAL_BASE = 'http://dsh.internal'
 const CHANNEL_PATTERN = /^\/[A-Za-z0-9._~-]+$/
 const ENDPOINT_SEGMENT_PATTERN = /^[A-Za-z0-9_$.-]+$/
+
+/**
+ * This page's instance id, minted once per document.
+ *
+ * It is correlation, not identity: the server resolves the member from the signed
+ * cookie and only uses this to tell two tabs or two devices of the same member
+ * apart. Because it is minted lazily on the first call it survives a bundle loaded
+ * before the page finished settling, and because it is module state it is the same
+ * value for every caller on this page.
+ */
+let pageInstanceId: string | undefined
+
+/** Read this page's instance id, minting it on first use. */
+function instanceId(): string {
+  pageInstanceId ??= randomUuid()
+  return pageInstanceId
+}
 
 /** Transport this caller posts through; same signature as the global `fetch`. */
 export type RpcFetch = (input: URL, init: RequestInit) => Promise<Response>
@@ -44,7 +62,12 @@ export function createWebConnectionRpc(doFetch?: RpcFetch, openStream?: RpcStrea
         new URL(`${channel}/${endpoint}`, resolveBase()),
         {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: {
+            'content-type': 'application/json',
+            // Sent with every call so a control decision can tell this tab from
+            // another tab of the same member.
+            [CLIENT_INSTANCE_HEADER]: instanceId(),
+          },
           body: JSON.stringify(message),
           ...signal === undefined ? {} : { signal },
         },
